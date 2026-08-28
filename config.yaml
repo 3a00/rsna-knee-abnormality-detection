@@ -1,0 +1,119 @@
+project:
+  root: "/home/wenalz/Documents/Antigravity projects/RSNA_MRI"
+  seed: 42
+
+data:
+  raw_dir: "data/raw"
+  labels_dir: "data/labels"
+  splits_dir: "data/splits"
+  train_csv: "data/raw/train.csv"
+  train_series_csv: "data/raw/train_series.csv"
+  test_csv: "data/raw/test.csv"
+  test_series_csv: "data/raw/test_series.csv"
+  sample_submission: "data/raw/sample_submission.csv"
+  # Kaggle DICOM root (not stored locally — Kaggle only)
+  dicom_root: "/kaggle/input/rsna-knee-abnormality-detection"
+
+labels:
+  # Exact column names from train.csv and sample_submission.csv
+  # NEVER hardcode these anywhere else — always load from this list
+  columns:
+    - "ACL"
+    - "MCL"
+    - "Medial Meniscus"
+    - "Lateral Meniscus"
+    - "Medial OA"
+    - "Lateral OA"
+    - "PF OA"
+    - "Effusion"
+    - "Synovitis"
+    - "Baker's"
+    - "Contusion"
+    - "Fracture"
+  n_classes: 12
+
+cv:
+  n_folds: 5
+  # Phase 1: placeholder split only — NOT for model training.
+  # Phase 3: real scanner-fingerprint StratifiedGroupKFold on Kaggle.
+  phase1_placeholder_csv: "data/splits/cv_folds_PLACEHOLDER.csv"
+  phase3_final_csv: "data/splits/cv_folds_5fold.csv"
+  # Pre-scanned DICOM fingerprints — output of scan_dicom_fingerprints.py (Kaggle step 0)
+  # train_series.csv does NOT contain scanner metadata — must scan raw DICOM headers
+  fingerprints_csv: "data/labels/dicom_fingerprints.csv"
+  # DICOM tags for Phase 3 fingerprinting (unavailable locally — Kaggle DICOM access required)
+  fingerprint_tags:
+    - "Manufacturer"
+    - "ManufacturerModelName"
+    - "SoftwareVersions"
+    - "ImagingFrequency"
+    - "ReceiveCoilName"
+
+normalization:
+  # MRI-appropriate normalization: per-volume percentile clipping.
+  # NOT a fixed HU window (HU is CT terminology; MRI intensities are arbitrary).
+  percentile_low: 0.5
+  percentile_high: 99.5
+
+outputs:
+  weights_dir: "outputs/weights"
+  logs_dir: "outputs/logs"
+  submissions_dir: "outputs/submissions"
+
+nlp:
+  # Model identifiers — read dynamically by orchestrator
+  gemini_model_primary: "gemini-3.7-flash"
+  gemini_model_fallback: "gemini-3.6-flash"
+
+  # Extraction parameters
+  batch_size: 50
+  n_concurrent_workers: 8
+
+  # File paths
+  cache_dir: "data/labels/cache"
+  pseudo_labels_csv: "data/labels/pseudo_labels.csv"
+  concordance_json: "outputs/logs/phase2_concordance.json"
+  lang_csv: "data/labels/language_tags.csv"
+
+  # Label mapping — train.csv columns to Pydantic schema field names
+  label_map:
+    "ACL": "acl_tear"
+    "MCL": "mcl_tear"
+    "Medial Meniscus": "medial_meniscus"
+    "Lateral Meniscus": "lateral_meniscus"
+    "Medial OA": "medial_oa"
+    "Lateral OA": "lateral_oa"
+    "PF OA": "patellofemoral_oa"
+    "Effusion": "joint_effusion"
+    "Synovitis": "synovitis"
+    "Baker's": "bakers_cyst"
+    "Contusion": "bone_contusion"
+    "Fracture": "fracture"
+
+# ============================================================================
+# Phase 3 — Model Configuration
+# ============================================================================
+model:
+  backbone: "efficientnet_b2"         # timm model name
+  n_slices: 8                         # Slices per plane (fast: was 16)
+  target_size: [224, 224]             # Resize to (H, W)
+  stack_size: 3                       # 2.5D consecutive channel depth (must be odd)
+  attn_hidden_dim: 128                # Attention pooling hidden MLP dim
+  dropout: 0.3                        # Dropout before classifier head
+  local_weights_path: null
+
+# ============================================================================
+# Phase 3 -- Training Configuration
+# ============================================================================
+training:
+  n_epochs: 5                         # Epochs per fold (fast baseline run)
+  batch_size: 2                       # Studies per batch (safe with num_workers=0)
+  grad_accum_steps: 4                 # Effective batch = 2 x 4 = 8 studies
+  lr: 1.0e-4                          # AdamW initial LR
+  weight_decay: 1.0e-2                # AdamW L2 regularization
+  num_workers: 0                      # 0 = synchronous loading (no deadlock)
+  dropout: 0.3                        # Consistent with model.dropout
+  freeze_backbone_epochs: 1           # Backbone warm-up epochs
+  gold_weight: 5.0                    # Loss multiplier for 58 gold studies
+  grad_clip_norm: 1.0                 # Gradient clipping max norm
+  use_grad_checkpointing: true        # ~60% VRAM reduction via timm grad checkpointing
