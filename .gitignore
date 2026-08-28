@@ -1,0 +1,31 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+.coverage
+htmlcov/
+
+# Heavy Data & Caches (Keep local/on Kaggle, not on GitHub)
+data/raw/*.dcm
+data/labels/cache/
+data/rsna.db
+
+# Heavy Model Checkpoints & Large Outputs
+outputs/weights/*.pth
+outputs/weights/*.bin
+outputs/weights/*.pt
+outputs/weights/*.onnx
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Secrets & OS junk
+.env
+.DS_Store
+*.log
