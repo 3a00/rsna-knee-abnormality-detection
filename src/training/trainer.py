@@ -125,28 +125,70 @@ def _make_augment_fn():
         return None
 
 
-def check_time_budget(
-    n_train: int,
-    n_val: int,
-    batch_size: int,
+def run_budget_gate(
+    train_loader: "DataLoader",
     n_epochs: int,
     n_folds: int,
     budget_hours: float = 8.5,
+    n_probe_batches: int = 3,
 ) -> None:
-    """Phase D budget gate: time one batch and abort if projected run exceeds budget.
+    """Phase D budget gate: time real DataLoader batches and project total runtime.
 
-    Prints a projection. Does NOT abort -- just warns if over budget so the
-    user can decide. Called at the start of fold 0 epoch 0.
+    Times n_probe_batches actual batches from train_loader (not a mock), projects
+    the total runtime for all folds and epochs, and prints a warning if the
+    projection exceeds the session budget.
+
+    Does NOT raise or abort -- prints a warning so the user can decide.
+    Call this at the start of fold 0 before the training loop begins.
 
     Args:
-        n_train:      Number of training studies in this fold.
-        n_val:        Number of validation studies in this fold.
-        batch_size:   DataLoader batch size.
-        n_epochs:     Epochs per fold.
-        n_folds:      Total folds (for full run projection).
-        budget_hours: Target session budget in hours (default 8.5 for Kaggle 9h cap).
+        train_loader:    The real DataLoader (cache-backed or DICOM-backed).
+        n_epochs:        Epochs per fold.
+        n_folds:         Total folds (for full run projection).
+        budget_hours:    Budget limit in hours. Default 8.5 for Kaggle's 9h cap.
+        n_probe_batches: Number of batches to time for projection. Default 3.
     """
-    print("\n   [Budget Gate] Checking projected runtime...")
+    print("\n   [Budget Gate] Timing real DataLoader batches...")
+    sys.stdout.flush()
+
+    times = []
+    for i, _ in enumerate(train_loader):
+        if i == 0:
+            t_start = time.time()  # Start after first batch (warms up workers)
+        elif i <= n_probe_batches:
+            times.append(time.time() - t_start)
+            t_start = time.time()
+        if i >= n_probe_batches:
+            break
+
+    if not times:
+        print("   [Budget Gate] Could not time batches (DataLoader empty?). Skipping.")
+        return
+
+    secs_per_batch  = sum(times) / len(times)
+    n_batches_epoch = len(train_loader)
+    secs_per_epoch  = secs_per_batch * n_batches_epoch
+    projected_total = secs_per_epoch * n_epochs * n_folds
+    projected_hours = projected_total / 3600.0
+
+    print(
+        f"   [Budget Gate] ~{secs_per_batch:.2f}s/batch x "
+        f"{n_batches_epoch} batches x "
+        f"{n_epochs} epochs x "
+        f"{n_folds} folds = "
+        f"~{projected_hours:.2f}h projected"
+    )
+
+    if projected_hours > budget_hours:
+        print(
+            f"   [Budget Gate] WARNING: Projected {projected_hours:.2f}h "
+            f"exceeds budget of {budget_hours:.1f}h. "
+            "Consider reducing n_epochs, n_slices, or batch_size before launching."
+        )
+    else:
+        print(
+            f"   [Budget Gate] OK: {projected_hours:.2f}h < {budget_hours:.1f}h budget."
+        )
     sys.stdout.flush()
 
 
@@ -258,7 +300,7 @@ def train_fold(
         pin_memory=(n_workers > 0),  # pin_memory only useful with workers
         persistent_workers=(n_workers > 0),
         collate_fn=collate_fn,
-        drop_last=True,
+        drop_last=False,  # Keep all studies per epoch; BatchNorm safe with batch>=2
     )
     val_loader = DataLoader(
         _make_dataset(val_df, is_train=False),
@@ -270,7 +312,16 @@ def train_fold(
         collate_fn=collate_fn,
     )
 
-    # Initialize model
+    # Phase D budget gate -- run once at fold 0 to confirm we fit within session
+    if fold_id == 0:
+        run_budget_gate(
+            train_loader=train_loader,
+            n_epochs=cfg["training"]["n_epochs"],
+            n_folds=cfg["cv"]["n_folds"],
+            budget_hours=8.5,
+        )
+
+
     model = KneeMILModel(
         backbone_name=cfg["model"]["backbone"],
         n_classes=len(label_cols),

@@ -46,15 +46,19 @@ import pandas as pd
 # ============================================================================
 
 def _uid_to_seed(study_uid: str) -> int:
-    """Derive a stable per-study integer seed from the StudyInstanceUID string.
+    """Derive a stable, process-independent seed from a StudyInstanceUID string.
 
-    Using a UID-based seed instead of a fixed seed=42 ensures that different
-    studies sample different slices, and that the same study always samples the
-    same slices (reproducible across folds/epochs).
+    Uses hashlib.md5 instead of Python's built-in hash() because:
+      - Python hash() is salted per-process (PYTHONHASHSEED) since Python 3.3.
+      - In multiprocessing.Pool(spawn), each worker process has a DIFFERENT salt,
+        so hash(uid) returns different values in different workers.
+      - hashlib.md5 is deterministic across processes, machines, and Python versions.
 
-    The seed is taken modulo 2^31 to stay within numpy's integer seed range.
+    The seed is truncated to 8 hex chars -> int fits within numpy's seed range.
+    Must be identical in preprocess_volumes.py AND mri_dataset.py.
     """
-    return abs(hash(study_uid)) % (2 ** 31)
+    import hashlib
+    return int(hashlib.md5(study_uid.encode()).hexdigest()[:8], 16)
 
 
 def _select_slices_seeded(

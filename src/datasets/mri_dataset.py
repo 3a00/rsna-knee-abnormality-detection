@@ -60,15 +60,19 @@ SYNOVITIS_SOFT_COL = "synovitis_soft"
 # ============================================================================
 
 def _uid_to_seed(study_uid: str) -> int:
-    """Derive a stable per-study integer seed from the StudyInstanceUID string.
+    """Derive a stable, process-independent seed from a StudyInstanceUID string.
 
-    Ensures different studies sample different slices, but the same study
-    always samples the same slices (reproducible). Replaces the broken
-    fixed seed=42 (which caused identical slice selection for every study).
+    Uses hashlib.md5 instead of Python's built-in hash() because:
+      - Python hash() is salted per-process (PYTHONHASHSEED) since Python 3.3.
+      - In multiprocessing.Pool(spawn), each worker process has a DIFFERENT salt,
+        so hash(uid) returns different values in different workers.
+      - hashlib.md5 is deterministic across processes, machines, and Python versions.
 
-    The seed is taken modulo 2^31 to stay within numpy's integer range.
+    The seed is truncated to 8 hex chars -> int fits within numpy's seed range.
+    Must be identical in preprocess_volumes.py AND mri_dataset.py.
     """
-    return abs(hash(study_uid)) % (2 ** 31)
+    import hashlib
+    return int(hashlib.md5(study_uid.encode()).hexdigest()[:8], 16)
 
 
 def select_slices(
@@ -455,16 +459,17 @@ class KneeMRIDatasetCached(Dataset):
         self,
         volume: np.ndarray,
         plane_ok: bool,
-        seed: int,
     ) -> tuple[torch.Tensor, bool]:
         """Convert (N, H, W) float32 volume to (N, stack_size, H, W) tensor.
 
         Volume from cache is already selected (N slices) and resized (H, W).
-        We only apply stack_25d and optional augmentation here.
+        Only applies stack_25d and optional augmentation.
 
-        Note: For train-time diversity, we could re-sample from a 2N-slice
-        cache here. For simplicity, the current implementation uses the fixed
-        N slices stored in cache. This is consistent and reproducible.
+        Design note -- fixed N slices from cache (no per-epoch resampling):
+        The cache stores exactly N slices per plane selected at preprocessing time
+        using a per-study UID-derived seed. Training diversity comes from augmentation,
+        not slice resampling. This is correct for baseline; a 2N-slice cache could
+        enable per-epoch resampling in a future iteration.
         """
         if not plane_ok:
             return (
@@ -485,7 +490,6 @@ class KneeMRIDatasetCached(Dataset):
     def __getitem__(self, idx: int) -> dict:
         row = self.study_df.iloc[idx]
         study_uid = row["StudyInstanceUID"]
-        seed = _uid_to_seed(study_uid)
 
         cache_data = self._load_from_cache(study_uid)
 
@@ -493,13 +497,13 @@ class KneeMRIDatasetCached(Dataset):
             # Fast path: cache hit (~5ms)
             plane_present_arr = cache_data["plane_present"]
             sagittal, sag_ok = self._volume_to_tensor(
-                cache_data["sagittal"], bool(plane_present_arr[0]), seed
+                cache_data["sagittal"], bool(plane_present_arr[0])
             )
             coronal,  cor_ok = self._volume_to_tensor(
-                cache_data["coronal"],  bool(plane_present_arr[1]), seed
+                cache_data["coronal"],  bool(plane_present_arr[1])
             )
             axial,    axl_ok = self._volume_to_tensor(
-                cache_data["axial"],    bool(plane_present_arr[2]), seed
+                cache_data["axial"],    bool(plane_present_arr[2])
             )
         else:
             # Slow fallback: live DICOM decode (~1300ms)
