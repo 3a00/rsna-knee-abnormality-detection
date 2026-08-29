@@ -116,7 +116,7 @@ preprocess:
 # Phase 3 -- Training Configuration
 # ============================================================================
 training:
-  n_epochs: 10                        # Epochs per fold (matches AGENTS.md canonical value)
+  n_epochs: 8                        # Epochs per fold (matches AGENTS.md canonical value)
   batch_size: 4                       # Studies per batch (VRAM-safe for T4/P100)
   grad_accum_steps: 2                 # Effective batch = 4 x 2 = 8 studies
   lr: 1.0e-4                          # AdamW initial LR
