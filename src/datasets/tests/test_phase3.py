@@ -1,5 +1,5 @@
 """
-test_phase3.py -- Phase 3 Unit Tests (v3 Final)
+test_phase3.py -- Phase 3 Unit Tests
 
 Covers all major components of the Phase 3 image baseline:
     - select_slices: shape, padding, dtype
@@ -11,6 +11,9 @@ Covers all major components of the Phase 3 image baseline:
     - AttentionPooling: output shape, softmax constraint
     - MaskedBCEWithLogitsLoss: finite loss, NaN masking, gold upweighting
     - compute_per_label_auc: perfect AUC, NaN exclusion, macro averaging
+    - _uid_to_seed: process stability, cross-module consistency, numpy range
+    - KneeMRIDatasetCached: cache hit shapes, uint8->float conversion, plane_present,
+      cache miss zero-tensor fallback, partial-cache warning, complete-cache no-warning
 
 Run with:
     pytest src/datasets/tests/test_phase3.py -v
@@ -443,3 +446,197 @@ class TestComputePerLabelAUC:
         scores  = compute_per_label_auc(logits, targets, self.LABELS)
         # All labels have only one class -> all NaN -> macro_auc NaN
         assert np.isnan(scores["macro_auc"])
+
+
+# ============================================================================
+# Test: _uid_to_seed process stability
+# ============================================================================
+
+class TestUidToSeed:
+    """Verify _uid_to_seed returns consistent values independent of process state."""
+
+    def test_same_uid_same_seed(self):
+        """Same UID must always produce the same seed (no randomness)."""
+        from src.datasets.mri_dataset import _uid_to_seed
+        uid = "1.2.826.0.1.3680043.8.498.12345"
+        assert _uid_to_seed(uid) == _uid_to_seed(uid)
+
+    def test_different_uids_different_seeds(self):
+        """Different UIDs must produce different seeds (no collision for adjacent UIDs)."""
+        from src.datasets.mri_dataset import _uid_to_seed
+        seeds = {_uid_to_seed(f"uid_{i}") for i in range(20)}
+        assert len(seeds) == 20, "Expected all 20 UIDs to produce unique seeds"
+
+    def test_seed_in_valid_numpy_range(self):
+        """Seed must fit within numpy's valid range [0, 2^32)."""
+        from src.datasets.mri_dataset import _uid_to_seed
+        seed = _uid_to_seed("1.2.826.0.1.3680043.8.498.99999")
+        assert 0 <= seed < 2 ** 32
+
+    def test_seed_matches_preprocess_volumes(self):
+        """_uid_to_seed must return the identical value in both modules."""
+        from src.datasets.mri_dataset import _uid_to_seed as ds_seed
+        from scripts.preprocess_volumes import _uid_to_seed as pp_seed
+        uid = "1.2.826.0.1.3680043.8.498.test_consistency"
+        assert ds_seed(uid) == pp_seed(uid), (
+            "Seed mismatch between mri_dataset and preprocess_volumes -- "
+            "cached slices will differ from training-time slice expectations"
+        )
+
+
+# ============================================================================
+# Test: KneeMRIDatasetCached
+# ============================================================================
+
+def _make_study_df(n: int = 3) -> pd.DataFrame:
+    """Create a minimal study DataFrame for testing the cached dataset."""
+    rows = []
+    for i in range(n):
+        row = {col: float(i % 2) for col in LABEL_COLS}
+        row["StudyInstanceUID"] = f"study_{i:04d}"
+        row["is_gold"] = int(i == 0)
+        row["synovitis_soft"] = 0.22
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _write_fake_npz(cache_dir, study_uid: str, n_slices: int = 4, h: int = 16, w: int = 16) -> None:
+    """Write a fake .npz cache file for one study."""
+    import os
+    os.makedirs(cache_dir, exist_ok=True)
+    np.savez_compressed(
+        os.path.join(cache_dir, f"{study_uid}.npz"),
+        sagittal=np.random.randint(0, 256, (n_slices, h, w), dtype=np.uint8),
+        coronal=np.random.randint(0, 256, (n_slices, h, w), dtype=np.uint8),
+        axial=np.random.randint(0, 256, (n_slices, h, w), dtype=np.uint8),
+        plane_present=np.array([True, True, True], dtype=bool),
+    )
+
+
+class TestKneeMRIDatasetCached:
+
+    def test_cache_hit_output_shapes(self, tmp_path):
+        """Cache hit path must return tensors with correct shapes."""
+        from src.datasets.mri_dataset import KneeMRIDatasetCached
+        n_slices, h, w, stack = 4, 16, 16, 3
+        study_df = _make_study_df(2)
+
+        for uid in study_df["StudyInstanceUID"]:
+            _write_fake_npz(tmp_path, uid, n_slices, h, w)
+
+        ds = KneeMRIDatasetCached(
+            study_df=study_df,
+            cache_dir=str(tmp_path),
+            label_cols=LABEL_COLS,
+            n_slices=n_slices,
+            target_size=(h, w),
+            stack_size=stack,
+            is_train=False,
+        )
+        item = ds[0]
+        assert item["sagittal"].shape == (n_slices, stack, h, w)
+        assert item["coronal"].shape  == (n_slices, stack, h, w)
+        assert item["axial"].shape    == (n_slices, stack, h, w)
+        assert item["plane_present"].shape == (3,)
+        assert item["labels"].shape == (12,)
+
+    def test_cache_hit_uint8_to_float_conversion(self, tmp_path):
+        """Cache values (uint8 0-255) must be converted to float32 in [0,1]."""
+        from src.datasets.mri_dataset import KneeMRIDatasetCached
+        study_df = _make_study_df(1)
+        uid = study_df["StudyInstanceUID"].iloc[0]
+        # Write all-255 (max) uint8 -- should map to 1.0
+        np.savez_compressed(
+            str(tmp_path / f"{uid}.npz"),
+            sagittal=np.full((4, 16, 16), 255, dtype=np.uint8),
+            coronal=np.full((4, 16, 16), 0, dtype=np.uint8),
+            axial=np.full((4, 16, 16), 128, dtype=np.uint8),
+            plane_present=np.array([True, True, True], dtype=bool),
+        )
+        ds = KneeMRIDatasetCached(
+            study_df=study_df, cache_dir=str(tmp_path),
+            label_cols=LABEL_COLS, n_slices=4, target_size=(16, 16), stack_size=3,
+        )
+        item = ds[0]
+        assert item["sagittal"].dtype == torch.float32
+        assert float(item["sagittal"].max()) == pytest.approx(1.0, abs=0.005)
+        assert float(item["coronal"].max()) == pytest.approx(0.0, abs=0.005)
+
+    def test_cache_hit_plane_present_preserved(self, tmp_path):
+        """plane_present must reflect the values stored in the .npz."""
+        from src.datasets.mri_dataset import KneeMRIDatasetCached
+        study_df = _make_study_df(1)
+        uid = study_df["StudyInstanceUID"].iloc[0]
+        np.savez_compressed(
+            str(tmp_path / f"{uid}.npz"),
+            sagittal=np.zeros((4, 16, 16), dtype=np.uint8),
+            coronal=np.zeros((4, 16, 16), dtype=np.uint8),
+            axial=np.zeros((4, 16, 16), dtype=np.uint8),
+            plane_present=np.array([True, False, True], dtype=bool),
+        )
+        ds = KneeMRIDatasetCached(
+            study_df=study_df, cache_dir=str(tmp_path),
+            label_cols=LABEL_COLS, n_slices=4, target_size=(16, 16), stack_size=3,
+        )
+        item = ds[0]
+        pp = item["plane_present"]
+        assert pp[0].item() is True
+        assert pp[1].item() is False
+        assert pp[2].item() is True
+
+    def test_cache_miss_returns_zero_tensors_no_dicom_root(self, tmp_path):
+        """Cache miss with no dicom_root must return zero tensors and a warning."""
+        from src.datasets.mri_dataset import KneeMRIDatasetCached
+        study_df = _make_study_df(1)  # No .npz files written
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            ds = KneeMRIDatasetCached(
+                study_df=study_df, cache_dir=str(tmp_path),
+                label_cols=LABEL_COLS, n_slices=4, target_size=(16, 16), stack_size=3,
+                dicom_root=None,
+            )
+            # Init-time warning about missing cache entries
+            assert any("cache" in str(warning.message).lower() for warning in w)
+
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            item = ds[0]
+
+        # Zero tensors returned for all planes
+        assert float(item["sagittal"].abs().sum()) == pytest.approx(0.0)
+        assert float(item["coronal"].abs().sum())  == pytest.approx(0.0)
+        assert float(item["axial"].abs().sum())    == pytest.approx(0.0)
+
+    def test_init_warns_on_partial_cache(self, tmp_path):
+        """Init must emit a UserWarning when some studies are missing from cache."""
+        from src.datasets.mri_dataset import KneeMRIDatasetCached
+        study_df = _make_study_df(3)
+        # Only write cache for 1 of 3 studies
+        _write_fake_npz(tmp_path, study_df["StudyInstanceUID"].iloc[0])
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            KneeMRIDatasetCached(
+                study_df=study_df, cache_dir=str(tmp_path),
+                label_cols=LABEL_COLS, n_slices=4, target_size=(16, 16), stack_size=3,
+            )
+        assert any(issubclass(warning.category, UserWarning) for warning in w)
+        assert any("cache" in str(warning.message).lower() for warning in w)
+
+    def test_no_warning_when_cache_complete(self, tmp_path):
+        """Init must NOT emit cache warnings when all studies are cached."""
+        from src.datasets.mri_dataset import KneeMRIDatasetCached
+        study_df = _make_study_df(3)
+        for uid in study_df["StudyInstanceUID"]:
+            _write_fake_npz(tmp_path, uid)
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            KneeMRIDatasetCached(
+                study_df=study_df, cache_dir=str(tmp_path),
+                label_cols=LABEL_COLS, n_slices=4, target_size=(16, 16), stack_size=3,
+            )
+        cache_warnings = [x for x in w if "cache" in str(x.message).lower()]
+        assert len(cache_warnings) == 0
+
