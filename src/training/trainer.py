@@ -113,7 +113,7 @@ def _make_augment_fn():
                 shift_limit=0.05, scale_limit=0.1,
                 rotate_limit=15, p=0.5
             ),
-            A.GaussNoise(var_limit=(0.001, 0.005), p=0.3),
+            A.GaussNoise(std_range=(0.001, 0.005), p=0.3),
             A.RandomBrightnessContrast(
                 brightness_limit=0.1, contrast_limit=0.1, p=0.3
             ),
@@ -125,69 +125,132 @@ def _make_augment_fn():
         return None
 
 
+def _train_one_batch(
+    model: nn.Module,
+    batch: dict,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    device: torch.device,
+    accum_steps: int,
+) -> float:
+    """Run one real forward+backward+optimizer step. Returns raw (unscaled) batch loss.
+
+    Used by run_budget_gate for warmup and timing with real model load,
+    and available for any future use.
+    """
+    planes = {k: batch[k].to(device) for k in ["sagittal", "coronal", "axial"]}
+    plane_mask = batch["plane_present"].to(device)
+    labels = batch["labels"].to(device)
+    is_gold = batch["is_gold"].to(device)
+
+    with autocast("cuda"):
+        logits, _ = model(planes, plane_mask=plane_mask)
+        loss = criterion(logits, labels, is_gold) / accum_steps
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+
+    return loss.item() * accum_steps
+
+
 def run_budget_gate(
     train_loader: "DataLoader",
+    model: nn.Module,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    device: torch.device,
+    accum_steps: int,
     n_epochs: int,
     n_folds: int,
     budget_hours: float = 8.5,
-    n_probe_batches: int = 3,
+    n_warmup: int = 2,
+    n_probe: int = 3,
 ) -> None:
-    """Phase D budget gate: time real DataLoader batches and project total runtime.
+    """Phase D budget gate: run real training steps to project true session runtime.
 
-    Times n_probe_batches actual batches from train_loader (not a mock), projects
-    the total runtime for all folds and epochs, and prints a warning if the
-    projection exceeds the session budget.
+    IMPORTANT: Must be called AFTER the model/optimizer are created so it can
+    run actual forward+backward steps. The budget gate performs warmup batches
+    (without timing) followed by timed batches, capturing the true post-unfreeze
+    training throughput (not just data-loading speed).
 
-    Does NOT raise or abort -- prints a warning so the user can decide.
-    Call this at the start of fold 0 before the training loop begins.
+    Model weights are minimally perturbed by warmup/probe -- negligible vs. 8 epochs.
 
     Args:
-        train_loader:    The real DataLoader (cache-backed or DICOM-backed).
-        n_epochs:        Epochs per fold.
-        n_folds:         Total folds (for full run projection).
-        budget_hours:    Budget limit in hours. Default 8.5 for Kaggle's 9h cap.
-        n_probe_batches: Number of batches to time for projection. Default 3.
+        train_loader:  The real training DataLoader.
+        model:         Initialized KneeMILModel on device.
+        criterion:     Loss function.
+        optimizer:     AdamW optimizer.
+        scaler:        GradScaler for AMP.
+        device:        CUDA device.
+        accum_steps:   Gradient accumulation steps.
+        n_epochs:      Epochs per fold.
+        n_folds:       Total folds.
+        budget_hours:  Session budget (default 8.5, comfortably under 9h Kaggle cap).
+        n_warmup:      Warmup batches to populate cudnn caches before timing.
+        n_probe:       Timed batches for projection.
     """
-    print("\n   [Budget Gate] Timing real DataLoader batches...")
+    print("\n   [Budget Gate] Warming up with real training steps...")
     sys.stdout.flush()
 
-    times = []
-    for i, _ in enumerate(train_loader):
-        if i == 0:
-            t_start = time.time()  # Start after first batch (warms up workers)
-        elif i <= n_probe_batches:
-            times.append(time.time() - t_start)
-            t_start = time.time()
-        if i >= n_probe_batches:
+    model.train()
+    # Warmup: real training batches to spin up cudnn autotune, AMP state, etc.
+    for i, batch in enumerate(train_loader):
+        if i >= n_warmup:
             break
+        _train_one_batch(model, batch, criterion, optimizer, scaler, device, accum_steps)
+
+    print(f"   [Budget Gate] Timed probe ({n_probe} batches)...")
+    sys.stdout.flush()
+
+    times: list[float] = []
+    for i, batch in enumerate(train_loader):
+        if i >= n_probe:
+            break
+        t0 = time.time()
+        _train_one_batch(model, batch, criterion, optimizer, scaler, device, accum_steps)
+        times.append(time.time() - t0)
 
     if not times:
-        print("   [Budget Gate] Could not time batches (DataLoader empty?). Skipping.")
+        print("   [Budget Gate] No batches timed (empty DataLoader?). Skipping.")
         return
 
-    secs_per_batch  = sum(times) / len(times)
+    secs_per_batch = sum(times) / len(times)
     n_batches_epoch = len(train_loader)
-    secs_per_epoch  = secs_per_batch * n_batches_epoch
-    projected_total = secs_per_epoch * n_epochs * n_folds
-    projected_hours = projected_total / 3600.0
+    secs_per_epoch_postunfreeze = secs_per_batch * n_batches_epoch
+
+    # First freeze_backbone_epochs epochs are ~40% faster (no backbone gradients).
+    # Estimate weighted average: 3 frozen-epochs @ ~40% of post-freeze time + remaining.
+    n_frozen_epochs = 2  # freeze_backbone_epochs=2
+    n_unfrozen_epochs = n_epochs - n_frozen_epochs
+    estimated_secs_per_fold = (
+        n_frozen_epochs * secs_per_epoch_postunfreeze * 0.4
+        + n_unfrozen_epochs * secs_per_epoch_postunfreeze
+    )
+    projected_hours = (estimated_secs_per_fold * n_folds) / 3600.0
 
     print(
-        f"   [Budget Gate] ~{secs_per_batch:.2f}s/batch x "
-        f"{n_batches_epoch} batches x "
-        f"{n_epochs} epochs x "
-        f"{n_folds} folds = "
+        f"   [Budget Gate] ~{secs_per_batch:.2f}s/batch | "
+        f"{n_batches_epoch} batches x {n_epochs} ep x {n_folds} folds = "
         f"~{projected_hours:.2f}h projected"
     )
 
+    margin_pct = (budget_hours - projected_hours) / budget_hours * 100
     if projected_hours > budget_hours:
         print(
-            f"   [Budget Gate] WARNING: Projected {projected_hours:.2f}h "
-            f"exceeds budget of {budget_hours:.1f}h. "
-            "Consider reducing n_epochs, n_slices, or batch_size before launching."
+            f"   [Budget Gate] *** WARNING: Projected {projected_hours:.2f}h "
+            f"exceeds {budget_hours:.1f}h budget by {-margin_pct:.0f}% ***"
         )
+        print("   [Budget Gate] Reduce n_epochs, n_slices, or enable multi-GPU.")
     else:
         print(
-            f"   [Budget Gate] OK: {projected_hours:.2f}h < {budget_hours:.1f}h budget."
+            f"   [Budget Gate] OK: {projected_hours:.2f}h < {budget_hours:.1f}h "
+            f"({margin_pct:.0f}% margin)"
         )
     sys.stdout.flush()
 
@@ -312,16 +375,6 @@ def train_fold(
         collate_fn=collate_fn,
     )
 
-    # Phase D budget gate -- run once at fold 0 to confirm we fit within session
-    if fold_id == 0:
-        run_budget_gate(
-            train_loader=train_loader,
-            n_epochs=cfg["training"]["n_epochs"],
-            n_folds=cfg["cv"]["n_folds"],
-            budget_hours=8.5,
-        )
-
-
     model = KneeMILModel(
         backbone_name=cfg["model"]["backbone"],
         n_classes=len(label_cols),
@@ -332,6 +385,16 @@ def train_fold(
         freeze_backbone_epochs=cfg["training"]["freeze_backbone_epochs"],
         use_grad_checkpointing=cfg["training"].get("use_grad_checkpointing", True),
     ).to(device)
+
+    # Wrap in DataParallel if multiple GPUs are available
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"   Multi-GPU: using nn.DataParallel across {n_gpus} GPUs")
+        model = nn.DataParallel(model)
+    elif n_gpus == 1:
+        print(f"   Single GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("   No GPU detected -- training on CPU")
 
     criterion = MaskedBCEWithLogitsLoss(
         gold_weight=cfg["training"]["gold_weight"]
@@ -348,6 +411,65 @@ def train_fold(
     )
     scaler = GradScaler("cuda")
 
+    # Phase D budget gate -- run AFTER model/optimizer created so it measures
+    # real training throughput (post-unfreeze), not just data loading.
+    if fold_id == 0:
+        run_budget_gate(
+            train_loader=train_loader,
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            accum_steps=accum_steps,
+            n_epochs=cfg["training"]["n_epochs"],
+            n_folds=cfg["cv"]["n_folds"],
+            budget_hours=8.5,
+        )
+
+    # Checkpoint persistence to Kaggle Dataset (import here to keep it optional)
+    def _persist_checkpoint_to_dataset(fold_id: int, macro_auc: float) -> None:
+        """Copy the best checkpoint to a Kaggle Dataset to survive session cancellation."""
+        try:
+            import subprocess, time, json, shutil
+            kt = time.strftime("%Y%m%d_%H%M%S")
+            dataset_dir = Path(weights_dir).parent.parent / "checkpoint_dataset"
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+
+            src_file = Path(weights_dir) / f"fold{fold_id}_best.pth"
+            if not src_file.exists():
+                print(f"   [Persist] {src_file} not found, skipping.")
+                return
+
+            dst = dataset_dir / f"fold{fold_id}_best.pth"
+            shutil.copy2(src_file, dst)
+
+            manifest = {
+                "timestamp": kt,
+                "fold_id": fold_id,
+                "macro_auc": float(macro_auc),
+                "checkpoint": f"fold{fold_id}_best.pth",
+            }
+            with open(dataset_dir / "manifest.json", "w") as f:
+                json.dump(manifest, f, indent=2)
+
+            auc_str = f"{macro_auc:.4f}".replace(".", "p")
+            subprocess.run(
+                [
+                    "kaggle", "datasets", "version",
+                    "-p", str(dataset_dir),
+                    "-m", f"phase3_fold{fold_id}_best_auc_{auc_str}",
+                    "-r", "zip",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            print(f"   [Persist] fold{fold_id}_best.pth pushed to Kaggle Dataset.")
+        except Exception as e:
+            print(f"   [Persist] Dataset push failed (non-fatal): {e}")
+            sys.stdout.flush()
+
     best_macro_auc = 0.0
     best_auc_scores: dict[str, float] = {}
     oof_gold_logits_best:  list[np.ndarray] = []
@@ -361,7 +483,8 @@ def train_fold(
 
     for epoch in range(cfg["training"]["n_epochs"]):
         epoch_t_start = time.time()
-        model.on_epoch_start(epoch)
+        # DataParallel wraps the model; underlying module has on_epoch_start
+        (model.module if isinstance(model, nn.DataParallel) else model).on_epoch_start(epoch)
 
         # ---- Train ----
         model.train()
@@ -466,9 +589,12 @@ def train_fold(
             oof_gold_logits_best  = gold_logits_ep
             oof_gold_targets_best = gold_targets_ep
 
+            # Unwrap DataParallel before saving — keeps state_dict keys clean
+            # (no 'module.' prefix), so inference can load directly into KneeMILModel.
+            _unwrapped = model.module if isinstance(model, nn.DataParallel) else model
             torch.save({
                 "epoch":            epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": _unwrapped.state_dict(),
                 "macro_auc":        macro_auc,
                 "auc_scores":       auc_scores,
                 "fold_id":          fold_id,
@@ -491,6 +617,9 @@ def train_fold(
           f"Best Macro AUC: {best_macro_auc:.4f}")
     print(f"   OOF gold studies collected: {len(oof_logits)}")
     sys.stdout.flush()
+
+    # Persist checkpoint to Kaggle Dataset (survives session death)
+    _persist_checkpoint_to_dataset(fold_id, best_macro_auc)
 
     return {
         "auc_scores":       best_auc_scores,
