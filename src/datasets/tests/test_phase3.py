@@ -77,22 +77,22 @@ def dummy_planes() -> dict[str, torch.Tensor]:
 
 class TestSelectSlices:
     def test_output_shape_larger_volume(self, dummy_volume):
-        result = select_slices(dummy_volume, n_slices=24)
+        result = select_slices(dummy_volume, n_slices=24, seed=42)
         assert result.shape == (24, 64, 64)
 
     def test_padding_for_small_volume(self):
         small = np.ones((10, 16, 16), dtype=np.float32)
-        out = select_slices(small, n_slices=24)
+        out = select_slices(small, n_slices=24, seed=42)
         assert out.shape == (24, 16, 16)
         assert np.all(out[10:] == 0.0), "Padded slices must be zeros"
 
     def test_exact_size_volume(self):
         exact = np.ones((24, 16, 16), dtype=np.float32)
-        out = select_slices(exact, n_slices=24)
+        out = select_slices(exact, n_slices=24, seed=42)
         assert out.shape == (24, 16, 16)
 
     def test_dtype_preserved_float32(self, dummy_volume):
-        assert select_slices(dummy_volume, n_slices=16).dtype == np.float32
+        assert select_slices(dummy_volume, n_slices=16, seed=42).dtype == np.float32
 
 
 # ============================================================================
@@ -188,23 +188,20 @@ class TestSynovitisSoftTarget:
 
     def test_soft_target_for_nongold_row(self):
         """Non-gold rows must use synovitis_soft (0.22 or 0.63), not hard label."""
-        ds = KneeMRIDataset.__new__(KneeMRIDataset)
-        ds.label_cols = LABEL_COLS
-        labels = ds._build_labels(self._make_row(0, 0, 0.63))
+        from src.datasets.mri_dataset import _build_labels
+        labels = _build_labels(self._make_row(0, 0, 0.63), LABEL_COLS)
         assert abs(labels[self.SYN_IDX].item() - 0.63) < 1e-4
 
     def test_hard_target_for_gold_row(self):
         """Gold rows must use the authoritative hard integer label."""
-        ds = KneeMRIDataset.__new__(KneeMRIDataset)
-        ds.label_cols = LABEL_COLS
-        labels = ds._build_labels(self._make_row(1, 1.0, 0.22))
+        from src.datasets.mri_dataset import _build_labels
+        labels = _build_labels(self._make_row(1, 1.0, 0.22), LABEL_COLS)
         assert abs(labels[self.SYN_IDX].item() - 1.0) < 1e-4
 
     def test_other_labels_unaffected(self):
         """synovitis_soft routing must not affect other label indices."""
-        ds = KneeMRIDataset.__new__(KneeMRIDataset)
-        ds.label_cols = LABEL_COLS
-        labels = ds._build_labels(self._make_row(0, 0, 0.63))
+        from src.datasets.mri_dataset import _build_labels
+        labels = _build_labels(self._make_row(0, 0, 0.63), LABEL_COLS)
         # All non-Synovitis labels were set to 0.0
         for i, col in enumerate(LABEL_COLS):
             if col != "Synovitis":

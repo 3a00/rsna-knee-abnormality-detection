@@ -91,11 +91,11 @@ nlp:
     "Fracture": "fracture"
 
 # ============================================================================
-# Phase 3 — Model Configuration
+# Phase 3 -- Model Configuration
 # ============================================================================
 model:
   backbone: "efficientnet_b2"         # timm model name
-  n_slices: 8                         # Slices per plane (fast: was 16)
+  n_slices: 24                        # Slices per plane (matches AGENTS.md canonical value)
   target_size: [224, 224]             # Resize to (H, W)
   stack_size: 3                       # 2.5D consecutive channel depth (must be odd)
   attn_hidden_dim: 128                # Attention pooling hidden MLP dim
@@ -103,17 +103,26 @@ model:
   local_weights_path: null
 
 # ============================================================================
+# Phase 3 -- Preprocessing Cache Configuration
+# ============================================================================
+preprocess:
+  # One-time DICOM decode cache. Run scripts/preprocess_volumes.py before training.
+  # On Kaggle: use /kaggle/tmp/rsna_cache (fast local scratch, persists within session).
+  # On local machine: any writable path.
+  cache_dir: "/kaggle/tmp/rsna_cache"
+  n_workers: 4                        # Parallel workers for preprocessing (safe on Kaggle T4)
+
+# ============================================================================
 # Phase 3 -- Training Configuration
 # ============================================================================
 training:
-  n_epochs: 5                         # Epochs per fold (fast baseline run)
-  batch_size: 2                       # Studies per batch (safe with num_workers=0)
-  grad_accum_steps: 4                 # Effective batch = 2 x 4 = 8 studies
+  n_epochs: 10                        # Epochs per fold (matches AGENTS.md canonical value)
+  batch_size: 4                       # Studies per batch (VRAM-safe for T4/P100)
+  grad_accum_steps: 2                 # Effective batch = 4 x 2 = 8 studies
   lr: 1.0e-4                          # AdamW initial LR
   weight_decay: 1.0e-2                # AdamW L2 regularization
-  num_workers: 0                      # 0 = synchronous loading (no deadlock)
   dropout: 0.3                        # Consistent with model.dropout
-  freeze_backbone_epochs: 1           # Backbone warm-up epochs
+  freeze_backbone_epochs: 2           # Backbone warm-up epochs
   gold_weight: 5.0                    # Loss multiplier for 58 gold studies
   grad_clip_norm: 1.0                 # Gradient clipping max norm
   use_grad_checkpointing: true        # ~60% VRAM reduction via timm grad checkpointing
