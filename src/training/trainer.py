@@ -222,17 +222,8 @@ def run_budget_gate(
 
     secs_per_batch = sum(times) / len(times)
     n_batches_epoch = len(train_loader)
-    secs_per_epoch_postunfreeze = secs_per_batch * n_batches_epoch
-
-    # First freeze_backbone_epochs epochs are ~40% faster (no backbone gradients).
-    # Estimate weighted average: 3 frozen-epochs @ ~40% of post-freeze time + remaining.
-    n_frozen_epochs = 2  # freeze_backbone_epochs=2
-    n_unfrozen_epochs = n_epochs - n_frozen_epochs
-    estimated_secs_per_fold = (
-        n_frozen_epochs * secs_per_epoch_postunfreeze * 0.4
-        + n_unfrozen_epochs * secs_per_epoch_postunfreeze
-    )
-    projected_hours = (estimated_secs_per_fold * n_folds) / 3600.0
+    secs_per_epoch = secs_per_batch * n_batches_epoch
+    projected_hours = (secs_per_epoch * n_epochs * n_folds) / 3600.0
 
     print(
         f"   [Budget Gate] ~{secs_per_batch:.2f}s/batch | "
@@ -386,15 +377,7 @@ def train_fold(
         use_grad_checkpointing=cfg["training"].get("use_grad_checkpointing", True),
     ).to(device)
 
-    # Wrap in DataParallel if multiple GPUs are available
-    n_gpus = torch.cuda.device_count()
-    if n_gpus > 1:
-        print(f"   Multi-GPU: using nn.DataParallel across {n_gpus} GPUs")
-        model = nn.DataParallel(model)
-    elif n_gpus == 1:
-        print(f"   Single GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print("   No GPU detected -- training on CPU")
+    print(f"   Single GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 
     criterion = MaskedBCEWithLogitsLoss(
         gold_weight=cfg["training"]["gold_weight"]
@@ -410,22 +393,6 @@ def train_fold(
         eta_min=cfg["training"]["lr"] * 0.01,
     )
     scaler = GradScaler("cuda")
-
-    # Phase D budget gate -- run AFTER model/optimizer created so it measures
-    # real training throughput (post-unfreeze), not just data loading.
-    if fold_id == 0:
-        run_budget_gate(
-            train_loader=train_loader,
-            model=model,
-            criterion=criterion,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            accum_steps=accum_steps,
-            n_epochs=cfg["training"]["n_epochs"],
-            n_folds=cfg["cv"]["n_folds"],
-            budget_hours=8.5,
-        )
 
     # Checkpoint persistence to Kaggle Dataset (import here to keep it optional)
     def _persist_checkpoint_to_dataset(fold_id: int, macro_auc: float) -> None:
@@ -483,8 +450,22 @@ def train_fold(
 
     for epoch in range(cfg["training"]["n_epochs"]):
         epoch_t_start = time.time()
-        # DataParallel wraps the model; underlying module has on_epoch_start
-        (model.module if isinstance(model, nn.DataParallel) else model).on_epoch_start(epoch)
+        model.on_epoch_start(epoch)
+
+        # Run budget gate once at the first epoch AFTER backbone unfreezes
+        if epoch == cfg["training"]["freeze_backbone_epochs"] and fold_id == 0:
+            run_budget_gate(
+                train_loader=train_loader,
+                model=model,
+                criterion=criterion,
+                optimizer=optimizer,
+                scaler=scaler,
+                device=device,
+                accum_steps=accum_steps,
+                n_epochs=cfg["training"]["n_epochs"],
+                n_folds=cfg["cv"]["n_folds"],
+                budget_hours=8.5,
+            )
 
         # ---- Train ----
         model.train()
@@ -589,12 +570,9 @@ def train_fold(
             oof_gold_logits_best  = gold_logits_ep
             oof_gold_targets_best = gold_targets_ep
 
-            # Unwrap DataParallel before saving — keeps state_dict keys clean
-            # (no 'module.' prefix), so inference can load directly into KneeMILModel.
-            _unwrapped = model.module if isinstance(model, nn.DataParallel) else model
             torch.save({
                 "epoch":            epoch,
-                "model_state_dict": _unwrapped.state_dict(),
+                "model_state_dict": model.state_dict(),
                 "macro_auc":        macro_auc,
                 "auc_scores":       auc_scores,
                 "fold_id":          fold_id,
