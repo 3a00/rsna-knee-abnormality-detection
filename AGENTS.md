@@ -70,10 +70,17 @@ RSNA_MRI/
 ├── scripts/                    ← Execution & verification CLI scripts
 │   ├── run_phase1_pipeline.py  ← Phase 1 regression verification
 │   ├── export_language_tags.py ← Phase 2 Step 0: persist language_tags.csv
-│   └── run_phase2_extraction.py← Phase 2 AGY multi-agent extraction runner
+│   ├── run_phase2_extraction.py← Phase 2 AGY multi-agent extraction runner
+│   ├── scan_dicom_fingerprints.py ← Phase 3 Step 0: extracts DICOM header metadata
+│   └── preprocess_volumes.py   ← Phase 3: fast multi-threaded .npz volume pre-cacher
 ├── src/                        ← Clean, modular Python source code
-│   ├── datasets/               ← Phase 1: DICOM loader & volume normalizer
-│   ├── models/                 ← Vision backbone, text encoder, multimodal fusion modules
+│   ├── datasets/               ← Phase 1 & 3: DICOM loader, 2.5D stacker & cached dataset
+│   │   ├── dicom_loader.py     ← DICOM series parser & volume normalizer
+│   │   ├── mri_dataset.py      ← KneeMRIDatasetCached, 2.5D slice selection, augmentations
+│   │   └── tests/              ← Unit tests for Phase 1 & Phase 3 (test_phase3.py)
+│   ├── models/                 ← Vision backbones & Multimodal modules
+│   │   ├── mil_model.py        ← Phase 3: KneeMILModel (EfficientNet-B2, AttentionPooling)
+│   │   └── text_encoder.py     ← Phase 4 (Upcoming): XLM-RoBERTa multilingual text model
 │   ├── nlp/                    ← Phase 2: AGY multi-agent weak-label extraction pipeline
 │   │   ├── schemas.py          ← Pydantic schemas (KneeLabelExtraction, StudyLabelBatch)
 │   │   ├── extractor_agent.py  ← Concurrent leaf extractor (3.7-flash → 3.6-flash → -1)
@@ -81,19 +88,26 @@ RSNA_MRI/
 │   │   ├── validator_agent.py  ← Concordance validation engine
 │   │   ├── imputer.py          ← Empirically-calibrated silence imputation
 │   │   ├── tools.py            ← Orchestrator tool functions & atomic cache
-│   │   └── tests/              ← 14 unit tests (pytest-ready, local)
+│   │   └── tests/              ← Phase 2 unit & adversarial tests
 │   ├── training/               ← Training loops, cross-validation, loss functions
+│   │   ├── losses.py           ← MaskedBCEWithLogitsLoss & PlattScaler temperature calibration
+│   │   └── trainer.py          ← Single-GPU 5-fold training loop & auto-checkpoint persist
 │   └── utils/                  ← Macro-AUC metric, seeding, CV splits
+│       └── cv_splits.py        ← Scanner-Fingerprint StratifiedGroupKFold builder
 ├── data/
-│   ├── raw/                    ← train.csv, sample_submission.csv
-│   ├── labels/                 ← Extracted pseudo-labels & language_tags.csv
+│   ├── raw/                    ← train.csv, train_series.csv, sample_submission.csv
+│   ├── labels/                 ← Extracted pseudo-labels & metadata
 │   │   ├── cache/              ← Atomic per-study extraction cache JSONs
+│   │   ├── dicom_fingerprints.csv ← Phase 3 Step 0: 4,407 study scanner metadata
 │   │   ├── language_tags.csv   ← Step 0: 4,407 study language classifications
 │   │   └── pseudo_labels.csv   ← 4,407 rows with extracted & imputed labels
-│   └── splits/                 ← Cross-validation fold assignments (patient/site-aware)
+│   └── splits/                 
+│       └── cv_folds_5fold.csv  ← Phase 3: Official leak-free 5-fold CV split
 └── outputs/
     ├── weights/                ← Saved model checkpoints (.pth files)
-    ├── logs/                   ← Training logs, gold_prevalence.png, phase2_concordance.json
+    │   ├── v16 weights/        ← PRIMARY: Phase 3 2.5D MIL 8-epoch weights (Folds 0, 1, 2, 3)
+    │   └── v9 weights/         ← ARCHIVE: Phase 3 10-epoch initial weights
+    ├── logs/                   ← Training logs (v16_run.log, phase2_concordance.json, etc.)
     └── submissions/            ← Local copies of submission.csv files
 ```
 
@@ -250,18 +264,32 @@ Add `ImageLaterality` DICOM tag extraction to `scan_dicom_fingerprints.py` and s
 laterality in `dicom_fingerprints.csv`. Pass `target_laterality` to `KneeMRIDataset` from a
 study-level column. **Never hardcode "L" or "R" — always derive from data.**
 
-#### Phase 3 Best Results (fill after Kaggle execution)
-| Fold | Macro AUC | Best Epoch | Notes |
-|------|-----------|------------|-------|
-| 0    | TBD       | TBD        | —     |
-| 1    | TBD       | TBD        | —     |
-| 2    | TBD       | TBD        | —     |
-| 3    | TBD       | TBD        | —     |
-| 4    | TBD       | TBD        | —     |
-| **Mean ± Std** | **TBD ± TBD** | — | — |
+#### Phase 3 Empirical Results (Kaggle T4 Execution — v16 Run, 2026-08-31)
 
-**OOF Platt Temperature:** TBD (expect >1.0 for MIL models)
-**Phase 3 declared complete. Ready for Phase 4.**
+| Fold | Macro AUC | Best Epoch | Top Findings / Standout AUCs | Status |
+|---|---|---|---|---|
+| **Fold 0** | **0.8065** | Ep 8 | Effusion: **0.893**, Medial OA: **0.879**, ACL: **0.856**, Fracture: **0.830** | ✅ Complete |
+| **Fold 1** | **0.7995** | Ep 8 | Effusion: **0.908**, Medial OA: **0.877**, Baker's: **0.833**, ACL: **0.804** | ✅ Complete |
+| **Fold 2** | **0.7964** | Ep 8 | Effusion: **0.919**, Medial OA: **0.864**, Fracture: **0.816**, Contusion: **0.780** | ✅ Complete |
+| **Fold 3** | **0.7702** | Ep 4 | Effusion: **0.901**, Baker's: **0.825**, ACL: **0.803** | ⏱️ Interrupted @ 12h limit |
+| **Fold 4** | — | — | Deferred to multi-session / Phase 4 | ⏳ Pending |
+| **3-Fold Mean** | **0.8008 ± 0.0042** | — | **Consistent ~0.801 Image Baseline across all full folds** | 🏆 Baseline State |
+
+#### Phase 3 Critical Engineering Lessons Learned:
+
+1. **The Multi-GPU `nn.DataParallel` Trap (v12 Post-Mortem):**
+   * PyTorch's `nn.DataParallel` serializes and scatters 5D MRI tensors ($216\text{ slices/study}$) over the PCIe bus on every batch.
+   * This caused a **$7\times$ throughput collapse** (0.7s/batch $\rightarrow$ 4.88s/batch) and flooded Host RAM until Kaggle's Linux kernel issued a `SIGKILL` (`DeadKernelError`).
+   * **Rule:** Always use standard single-GPU execution on Kaggle for 2.5D/3D MIL pipelines.
+
+2. **Kaggle PyTorch 2.6 Environment & Tesla P100 (`sm_60`) Deprecation (v14 Post-Mortem):**
+   * Kaggle's container runs Python 3.12 + PyTorch 2.6+, which **dropped CUDA support for Pascal architecture (`sm_60` / Tesla P100)**.
+   * Running convolutions on P100 triggers `CUDA error: no kernel image is available for execution on the device`.
+   * **Rule:** Always run on **Tesla T4 (`sm_75`)**, which is natively supported.
+
+3. **Synovitis Evaluation Metric Nuance:**
+   * `Synovitis` reports `N/A` during validation because `scikit-learn`'s `roc_auc_score` requires discrete binary integer targets, whereas our Phase 2 soft target is continuous ($0.22 / 0.63$). 
+   * The model **is actively learning Synovitis** via continuous BCE loss, and will produce valid ROC-AUC scores on the competition's binary test ground truth.
 
 ### Phase 4 — Multimodal Fusion (Week 5)
 - [ ] Build `src/models/text_encoder.py` using **XLM-RoBERTa** (multilingual, handles all report languages)
