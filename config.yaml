@@ -40,11 +40,12 @@ labels:
   pos_weights: [2.70, 6.98, 1.21, 2.34, 2.12, 3.01, 1.83, 1.60, 2.94, 2.49, 2.21, 3.55]
 
 cv:
-  n_folds: 5
+  n_folds: 3
   # Phase 1: placeholder split only — NOT for model training.
-  # Phase 3: real scanner-fingerprint StratifiedGroupKFold on Kaggle.
+  # Phase 3: real scanner-fingerprint StratifiedGroupKFold on Kaggle (3-fold).
+  # 3 folds chosen for Kaggle T4 budget: 3 × 8 epochs = 24 epochs total (~2.4h).
   phase1_placeholder_csv: "data/splits/cv_folds_PLACEHOLDER.csv"
-  phase3_final_csv: "data/splits/cv_folds_5fold.csv"
+  phase3_final_csv: "data/splits/cv_folds_3fold.csv"
   # Pre-scanned DICOM fingerprints — output of scan_dicom_fingerprints.py (Kaggle step 0)
   # train_series.csv does NOT contain scanner metadata — must scan raw DICOM headers
   fingerprints_csv: "data/labels/dicom_fingerprints.csv"

@@ -8,11 +8,11 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done — awaiting architect review before merge
 
-- [ ] Update `compute_per_label_auc()` in `src/training/trainer.py` to accept `gold_mask: Optional[np.ndarray] = None` and restrict Synovitis AUC to gold studies.
-- [ ] Pass accumulated validation `is_gold` boolean mask to `compute_per_label_auc()` inside `train_fold()`.
-- [ ] Add `labels.pos_weights` vector to `config.yaml`.
-- [ ] Load `pos_weights` in `train_fold()`, move to active `device`, and pass to `MaskedBCEWithLogitsLoss`.
-- [ ] Add unit tests covering gold-masked Synovitis AUC and `pos_weight` loss scaling.
-- [ ] All unit tests pass.
+- [x] Update `compute_per_label_auc()` in `src/training/trainer.py` to accept `gold_mask: Optional[np.ndarray] = None` and restrict Synovitis AUC to gold studies.
+- [x] Pass accumulated validation `is_gold` boolean mask to `compute_per_label_auc()` inside `train_fold()`.
+- [x] Add `labels.pos_weights` vector to `config.yaml`.
+- [x] Load `pos_weights` in `train_fold()`, move to active `device`, and pass to `MaskedBCEWithLogitsLoss`.
+- [x] Add unit tests covering gold-masked Synovitis AUC and `pos_weight` loss scaling.
+- [x] All unit tests pass (54/54). Committed: `b899db9`.

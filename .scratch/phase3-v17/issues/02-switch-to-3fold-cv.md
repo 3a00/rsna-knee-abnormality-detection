@@ -8,10 +8,10 @@
 
 **Blocked by:** 01-metric-repair-and-loss-pos-weights.md
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Verify `data/splits/cv_folds_3fold.csv` contains 4,407 rows with ~1,469 studies and ~19–20 gold studies per fold.
-- [ ] Update `config.yaml` `cv.n_folds` to `3` and `cv.phase3_final_csv` to `"data/splits/cv_folds_3fold.csv"`.
-- [ ] Update docstrings in `src/training/trainer.py` referencing 5-fold to 3-fold.
-- [ ] Add unit test validating split properties (no scanner leakage, gold balance across all 3 folds).
-- [ ] Ensure all test suite tests pass.
+- [x] Verify `data/splits/cv_folds_3fold.csv` contains 4,407 rows with ~1,469 studies and ~19–20 gold studies per fold.
+- [x] Update `config.yaml` `cv.n_folds` to `3` and `cv.phase3_final_csv` to `"data/splits/cv_folds_3fold.csv"`.
+- [x] Update docstrings in `src/training/trainer.py` referencing 5-fold to 3-fold.
+- [x] Add unit test validating split properties (no scanner leakage, gold balance across all 3 folds).
+- [x] Ensure all test suite tests pass.
