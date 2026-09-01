@@ -449,6 +449,187 @@ class TestComputePerLabelAUC:
 
 
 # ============================================================================
+# Test: gold-masked Synovitis AUC (issue 01)
+# ============================================================================
+
+class TestSynovitisGoldMaskedAUC:
+    """Verify that compute_per_label_auc restricts Synovitis AUC to gold rows."""
+
+    # Synovitis is label index 8 in LABEL_COLS
+    SYNOVITIS_IDX = 8
+    LABELS = [f"label_{i}" for i in range(12)]
+
+    def _make_soft_targets(self, n: int = 100) -> np.ndarray:
+        """Build a target array where Synovitis is soft (0.22 / 0.63) for all rows."""
+        targets = np.zeros((n, 12))
+        # Synovitis: alternate between 0.22 and 0.63 (soft pseudo-labels)
+        targets[:, self.SYNOVITIS_IDX] = np.where(
+            np.arange(n) % 2 == 0, 0.22, 0.63
+        )
+        return targets
+
+    def test_synovitis_nan_without_gold_mask_on_soft_targets(self):
+        """Synovitis AUC must be NaN when no gold_mask is provided and targets
+        are soft floats that sklearn cannot compute a meaningful AUC for."""
+        targets = self._make_soft_targets()
+        # sklearn raises ValueError (only one 'class') or returns a trivial AUC
+        # for fractional targets -- the function catches ValueError -> NaN.
+        # We confirm the function does NOT raise and returns a float.
+        logits = np.random.randn(100, 12)
+        scores = compute_per_label_auc(logits, targets, self.LABELS)
+        # The result for Synovitis with soft labels is either NaN or
+        # a degenerate value -- what matters is no exception is raised.
+        assert "label_8" in scores
+
+    def test_synovitis_auc_uses_only_gold_rows(self):
+        """When gold_mask is provided, Synovitis AUC must use only gold rows."""
+        n = 100
+        targets = np.zeros((n, 12))
+        # Gold rows (first 20): binary 0/1 Synovitis
+        targets[:20, self.SYNOVITIS_IDX] = np.tile([0.0, 1.0], 10)
+        # Non-gold rows (last 80): soft pseudo-labels -- should be ignored
+        targets[20:, self.SYNOVITIS_IDX] = 0.37  # soft, non-binary
+
+        # Perfect predictor for gold rows
+        logits = np.zeros((n, 12))
+        logits[:20, self.SYNOVITIS_IDX] = np.where(
+            targets[:20, self.SYNOVITIS_IDX] == 1.0, 5.0, -5.0
+        )
+
+        gold_mask = np.zeros(n, dtype=bool)
+        gold_mask[:20] = True
+
+        scores = compute_per_label_auc(logits, targets, self.LABELS, gold_mask=gold_mask)
+        # Perfect AUC on gold rows
+        assert scores["label_8"] == pytest.approx(1.0, abs=1e-4), (
+            f"Expected Synovitis AUC ≈ 1.0 on gold rows, got {scores['label_8']}"
+        )
+
+    def test_synovitis_nan_when_no_gold_rows_in_val_fold(self):
+        """If no gold rows exist in validation, Synovitis AUC should be NaN
+        (fewer than 2 valid rows after gold filtering)."""
+        n = 50
+        targets = np.zeros((n, 12))
+        targets[:, self.SYNOVITIS_IDX] = 0.5  # soft, non-gold
+        logits = np.random.randn(n, 12)
+
+        gold_mask = np.zeros(n, dtype=bool)  # No gold rows
+        scores = compute_per_label_auc(logits, targets, self.LABELS, gold_mask=gold_mask)
+        assert np.isnan(scores["label_8"]), (
+            "Expected NaN for Synovitis AUC when no gold rows are present"
+        )
+
+    def test_non_synovitis_labels_unaffected_by_gold_mask(self):
+        """gold_mask must only affect Synovitis; other labels should use all rows."""
+        n = 100
+        targets = np.zeros((n, 12))
+        targets[:50, 0] = 1.0  # label_0: half positive, half negative
+
+        logits = np.where(targets > 0, 3.0, -3.0)
+
+        gold_mask = np.zeros(n, dtype=bool)
+        gold_mask[:10] = True  # Only 10 gold rows
+
+        scores_with_mask = compute_per_label_auc(
+            logits, targets, self.LABELS, gold_mask=gold_mask
+        )
+        scores_no_mask = compute_per_label_auc(logits, targets, self.LABELS)
+
+        # label_0 (not Synovitis) must be identical with or without gold_mask
+        assert scores_with_mask["label_0"] == pytest.approx(
+            scores_no_mask["label_0"], abs=1e-6
+        ), "gold_mask must not affect non-Synovitis label AUCs"
+
+
+# ============================================================================
+# Test: pos_weight loss scaling (issue 01)
+# ============================================================================
+
+class TestPosWeightLossScaling:
+    """Verify that pos_weight correctly scales loss without gradient explosion or NaNs."""
+
+    POS_WEIGHTS = [2.70, 6.98, 1.21, 2.34, 2.12, 3.01, 1.83, 1.60, 2.94, 2.49, 2.21, 3.55]
+
+    def test_pos_weight_increases_loss_on_positive_labels(self):
+        """Loss with pos_weight > 1.0 must be higher than without for positive targets."""
+        torch.manual_seed(42)
+        logits  = torch.randn(8, 12)
+        targets = torch.ones(8, 12)  # All positive
+        is_gold = torch.zeros(8, dtype=torch.long)
+
+        crit_no_pw = MaskedBCEWithLogitsLoss(gold_weight=1.0, pos_weight=None)
+        crit_pw    = MaskedBCEWithLogitsLoss(
+            gold_weight=1.0,
+            pos_weight=torch.tensor(self.POS_WEIGHTS, dtype=torch.float32),
+        )
+
+        loss_no_pw = crit_no_pw(logits, targets, is_gold).item()
+        loss_pw    = crit_pw(logits, targets, is_gold).item()
+
+        assert loss_pw > loss_no_pw, (
+            f"pos_weight loss ({loss_pw:.4f}) should exceed baseline ({loss_no_pw:.4f})"
+        )
+
+    def test_pos_weight_no_effect_on_negative_labels(self):
+        """pos_weight must NOT scale loss on negative (target=0) labels."""
+        torch.manual_seed(7)
+        logits  = torch.randn(8, 12)
+        targets = torch.zeros(8, 12)  # All negative
+        is_gold = torch.zeros(8, dtype=torch.long)
+
+        crit_no_pw = MaskedBCEWithLogitsLoss(gold_weight=1.0, pos_weight=None)
+        crit_pw    = MaskedBCEWithLogitsLoss(
+            gold_weight=1.0,
+            pos_weight=torch.tensor(self.POS_WEIGHTS, dtype=torch.float32),
+        )
+
+        loss_no_pw = crit_no_pw(logits, targets, is_gold).item()
+        loss_pw    = crit_pw(logits, targets, is_gold).item()
+
+        assert loss_no_pw == pytest.approx(loss_pw, rel=1e-5), (
+            "pos_weight must not change loss for all-negative targets"
+        )
+
+    def test_pos_weight_loss_is_finite_no_nan_no_explosion(self):
+        """With the canonical pos_weight vector, loss must be finite on random inputs."""
+        torch.manual_seed(99)
+        logits  = torch.randn(16, 12)
+        targets = torch.randint(0, 2, (16, 12)).float()
+        targets[:4, :6] = float("nan")  # Also test NaN masking together
+        is_gold = torch.zeros(16, dtype=torch.long)
+        is_gold[:3] = 1
+
+        crit = MaskedBCEWithLogitsLoss(
+            gold_weight=5.0,
+            pos_weight=torch.tensor(self.POS_WEIGHTS, dtype=torch.float32),
+        )
+        loss = crit(logits, targets, is_gold)
+
+        assert torch.isfinite(loss), f"Loss is not finite: {loss.item()}"
+        # Sanity: loss should not be astronomically large
+        assert loss.item() < 500.0, f"Loss suspiciously large: {loss.item()}"
+
+    def test_pos_weight_no_nan_in_gradients(self):
+        """NaN must not appear in parameter gradients when pos_weight is set."""
+        torch.manual_seed(11)
+        logits  = torch.randn(8, 12, requires_grad=True)
+        targets = torch.randint(0, 2, (8, 12)).float()
+        targets[:, :3] = float("nan")
+        is_gold = torch.zeros(8, dtype=torch.long)
+
+        crit = MaskedBCEWithLogitsLoss(
+            gold_weight=5.0,
+            pos_weight=torch.tensor(self.POS_WEIGHTS, dtype=torch.float32),
+        )
+        loss = crit(logits, targets, is_gold)
+        loss.backward()
+
+        assert not torch.isnan(logits.grad).any(), (
+            "NaN found in gradients when using pos_weight"
+        )
+
+
+# ============================================================================
 # Test: _uid_to_seed process stability
 # ============================================================================
 

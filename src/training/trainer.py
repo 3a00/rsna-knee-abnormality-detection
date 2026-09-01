@@ -52,6 +52,7 @@ def compute_per_label_auc(
     all_logits: np.ndarray,
     all_targets: np.ndarray,
     label_cols: list[str],
+    gold_mask: Optional[np.ndarray] = None,
 ) -> dict[str, float]:
     """Compute per-label and macro AUC, excluding NaN-masked samples per label.
 
@@ -59,19 +60,37 @@ def compute_per_label_auc(
     NaN targets are excluded per-label (different labels may have different
     subsets of valid studies).
 
+    For Synovitis (label index 8), when *gold_mask* is provided the AUC is
+    restricted to gold validation rows that have a binary 0/1 hard label.
+    This is necessary because non-gold Synovitis targets are soft pseudo-labels
+    (0.22 / 0.63) which cause sklearn's roc_auc_score to raise ValueError or
+    produce a meaningless metric.  Restricting to gold rows guarantees an
+    integer-valued ground truth and a valid, interpretable AUC.
+
     Args:
         all_logits: (N, 12) raw logits -- NOT sigmoid-activated.
         all_targets: (N, 12) float targets -- NaN for unaddressed silence.
         label_cols: 12 label names from config.yaml labels.columns.
+        gold_mask: Optional (N,) boolean array -- True for gold validation
+            studies.  When supplied, Synovitis AUC uses only gold rows.
 
     Returns:
         Dict with per-label AUC floats and 'macro_auc' (mean of valid-label AUCs).
     """
+    # Index of Synovitis in the canonical label list
+    SYNOVITIS_IDX = 8
+
     all_sigmoid = 1.0 / (1.0 + np.exp(-all_logits))
     scores: dict[str, float] = {}
 
     for i, col in enumerate(label_cols):
         valid = ~np.isnan(all_targets[:, i])
+
+        # Synovitis: restrict to gold rows when mask is available so that the
+        # AUC is computed on binary hard labels rather than soft pseudo-labels.
+        if i == SYNOVITIS_IDX and gold_mask is not None:
+            valid = valid & gold_mask.astype(bool)
+
         if valid.sum() < 2:
             scores[col] = float("nan")
             continue
@@ -380,7 +399,12 @@ def train_fold(
     print(f"   Single GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 
     criterion = MaskedBCEWithLogitsLoss(
-        gold_weight=cfg["training"]["gold_weight"]
+        gold_weight=cfg["training"]["gold_weight"],
+        pos_weight=(
+            torch.tensor(cfg["labels"]["pos_weights"], dtype=torch.float32)
+            if cfg.get("labels", {}).get("pos_weights") is not None
+            else None
+        ),
     )
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -507,6 +531,7 @@ def train_fold(
         model.eval()
         all_logits_list:  list[np.ndarray] = []
         all_targets_list: list[np.ndarray] = []
+        all_is_gold_list: list[np.ndarray] = []  # accumulated for Synovitis AUC
         gold_logits_ep:   list[np.ndarray] = []
         gold_targets_ep:  list[np.ndarray] = []
 
@@ -528,15 +553,19 @@ def train_fold(
 
                 all_logits_list.append(lnp)
                 all_targets_list.append(tnp)
+                all_is_gold_list.append(is_gold_mask)  # accumulate gold mask
 
                 if is_gold_mask.any():
                     gold_logits_ep.append(lnp[is_gold_mask])
                     gold_targets_ep.append(tnp[is_gold_mask])
 
-        all_logits  = np.concatenate(all_logits_list,  axis=0)
-        all_targets = np.concatenate(all_targets_list, axis=0)
-        auc_scores  = compute_per_label_auc(all_logits, all_targets, label_cols)
-        macro_auc   = auc_scores["macro_auc"]
+        all_logits   = np.concatenate(all_logits_list,  axis=0)
+        all_targets  = np.concatenate(all_targets_list, axis=0)
+        all_is_gold  = np.concatenate(all_is_gold_list, axis=0)  # (N,) bool
+        auc_scores   = compute_per_label_auc(
+            all_logits, all_targets, label_cols, gold_mask=all_is_gold
+        )
+        macro_auc    = auc_scores["macro_auc"]
 
         # Epoch timing and ETA
         epoch_elapsed = time.time() - epoch_t_start
