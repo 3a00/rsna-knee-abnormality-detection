@@ -31,6 +31,13 @@ labels:
     - "Contusion"
     - "Fracture"
   n_classes: 12
+  # Square-root scaled positive class weights for MaskedBCEWithLogitsLoss.
+  # Order matches labels.columns exactly:
+  #   ACL, MCL, Medial Meniscus, Lateral Meniscus, Medial OA, Lateral OA,
+  #   PF OA, Effusion, Synovitis, Baker's, Contusion, Fracture
+  # Derived from training-set label frequencies; sqrt-scaled to avoid
+  # gradient explosion on extreme imbalance (e.g. MCL neg_pos_ratio ~48.8×).
+  pos_weights: [2.70, 6.98, 1.21, 2.34, 2.12, 3.01, 1.83, 1.60, 2.94, 2.49, 2.21, 3.55]
 
 cv:
   n_folds: 5
