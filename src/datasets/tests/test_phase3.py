@@ -821,3 +821,133 @@ class TestKneeMRIDatasetCached:
         cache_warnings = [x for x in w if "cache" in str(x.message).lower()]
         assert len(cache_warnings) == 0
 
+
+# ============================================================================
+# Test: 3-fold Scanner-Fingerprint StratifiedGroupKFold split (issue 02)
+# ============================================================================
+
+@pytest.fixture(scope="class")
+def cv_3fold_df() -> pd.DataFrame:
+    """Load cv_folds_3fold.csv once per class; resolve path relative to repo root."""
+    from pathlib import Path
+    root = Path(__file__).parent.parent.parent.parent
+    csv_path = root / "data/splits/cv_folds_3fold.csv"
+    assert csv_path.exists(), (
+        f"cv_folds_3fold.csv not found at {csv_path}. "
+        "Run scripts/generate_cv_folds.py on Kaggle to generate it."
+    )
+    return pd.read_csv(csv_path)
+
+
+class TestCVSplit3Fold:
+    """Validate properties of cv_folds_3fold.csv required by issue 02.
+
+    Checks performed purely with pandas/numpy — no GPU/torch dependency.
+    The CSV is generated offline (scripts/generate_cv_folds.py) and committed
+    to data/splits/. These tests guard against accidental regeneration with
+    wrong parameters or file corruption.
+    """
+
+    CSV_PATH = "data/splits/cv_folds_3fold.csv"
+    EXPECTED_STUDIES = 4407
+    N_FOLDS = 3
+    MIN_GOLD_PER_FOLD = 19   # lowest observed across the three folds
+    MAX_FOLD_SIZE = 1470      # largest fold (fold 1)
+    MIN_FOLD_SIZE = 1468      # smallest fold (fold 2)
+
+    def test_total_study_count(self, cv_3fold_df):
+        """CSV must contain exactly 4,407 unique StudyInstanceUIDs."""
+        n_unique = cv_3fold_df["StudyInstanceUID"].nunique()
+        assert n_unique == self.EXPECTED_STUDIES, (
+            f"Expected {self.EXPECTED_STUDIES} unique studies, got {n_unique}"
+        )
+
+    def test_total_row_count_equals_study_count(self, cv_3fold_df):
+        """Each study must appear exactly once (one row per study)."""
+        assert len(cv_3fold_df) == self.EXPECTED_STUDIES, (
+            f"Expected {self.EXPECTED_STUDIES} rows, got {len(cv_3fold_df)} — "
+            "duplicate StudyInstanceUIDs detected"
+        )
+
+    def test_n_folds_is_3(self, cv_3fold_df):
+        """fold_id column must contain exactly 3 distinct values: 0, 1, 2."""
+        fold_ids = sorted(cv_3fold_df["fold_id"].unique().tolist())
+        assert fold_ids == [0, 1, 2], (
+            f"Expected fold_ids [0, 1, 2], got {fold_ids}"
+        )
+
+    def test_fold_sizes_balanced(self, cv_3fold_df):
+        """Each fold must have between MIN_FOLD_SIZE and MAX_FOLD_SIZE studies."""
+        counts = cv_3fold_df["fold_id"].value_counts()
+        for fold, count in counts.items():
+            assert self.MIN_FOLD_SIZE <= count <= self.MAX_FOLD_SIZE, (
+                f"Fold {fold} has {count} studies — outside "
+                f"[{self.MIN_FOLD_SIZE}, {self.MAX_FOLD_SIZE}] balanced range"
+            )
+
+    def test_no_scanner_leakage(self, cv_3fold_df):
+        """Every scanner fingerprint must appear in exactly ONE fold.
+
+        Scanner leakage artificially inflates AUC by ~0.053 (per AGENTS.md).
+        The split is only valid when each scanner's entire site is kept in one
+        fold — this is the core guarantee of Scanner-Fingerprint GroupKFold.
+        """
+        scanner_fold_counts = cv_3fold_df.groupby("scanner_fingerprint")["fold_id"].nunique()
+        leaked = scanner_fold_counts[scanner_fold_counts > 1]
+        assert len(leaked) == 0, (
+            f"{len(leaked)} scanner fingerprints appear in more than one fold. "
+            "This means scanner-site leakage is present — regenerate the split "
+            "using scripts/generate_cv_folds.py with GroupKFold on scanner_fingerprint."
+        )
+
+    def test_gold_studies_present_in_all_folds(self, cv_3fold_df):
+        """Every fold must contain at least MIN_GOLD_PER_FOLD gold studies.
+
+        Gold studies are used for OOF Platt calibration. A fold with no gold
+        studies would produce invalid calibration and break the post-training
+        pipeline.
+        """
+        gold_per_fold = cv_3fold_df.groupby("fold_id")["is_gold"].sum()
+        for fold, n_gold in gold_per_fold.items():
+            assert n_gold >= self.MIN_GOLD_PER_FOLD, (
+                f"Fold {fold} has only {int(n_gold)} gold studies — "
+                f"minimum required is {self.MIN_GOLD_PER_FOLD}"
+            )
+
+    def test_total_gold_count_equals_58(self, cv_3fold_df):
+        """Total gold studies across all folds must equal 58.
+
+        58 is the authoritative gold set size per AGENTS.md Gold Study
+        Governance Rules. Any deviation indicates a corruption of the
+        is_gold column or a new split generated against a different gold set.
+        """
+        total_gold = int(cv_3fold_df["is_gold"].sum())
+        assert total_gold == 58, (
+            f"Expected 58 total gold studies, got {total_gold}"
+        )
+
+    def test_split_type_column_correct(self, cv_3fold_df):
+        """split_type must be SCANNER_FINGERPRINT_STRATIFIEDGROUPKFOLD for all rows."""
+        expected = "SCANNER_FINGERPRINT_STRATIFIEDGROUPKFOLD"
+        wrong = cv_3fold_df[cv_3fold_df["split_type"] != expected]
+        assert len(wrong) == 0, (
+            f"{len(wrong)} rows have unexpected split_type. "
+            f"All rows must have split_type='{expected}'."
+        )
+
+    def test_required_columns_present(self, cv_3fold_df):
+        """CSV must have the five required columns in any order."""
+        required = {"StudyInstanceUID", "fold_id", "scanner_fingerprint",
+                    "is_gold", "split_type"}
+        missing = required - set(cv_3fold_df.columns)
+        assert len(missing) == 0, (
+            f"cv_folds_3fold.csv is missing required columns: {missing}"
+        )
+
+    def test_no_null_values(self, cv_3fold_df):
+        """No NaN values allowed in any column of the splits CSV."""
+        null_counts = cv_3fold_df.isnull().sum()
+        nulls = null_counts[null_counts > 0]
+        assert len(nulls) == 0, (
+            f"Null values found in cv_folds_3fold.csv:\n{nulls}"
+        )

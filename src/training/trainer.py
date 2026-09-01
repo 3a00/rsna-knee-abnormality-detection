@@ -2,7 +2,7 @@
 trainer.py -- Training Loop for RSNA Knee MRI Phase 3 Baseline
 
 Features:
-    - 5-fold StratifiedGroupKFold cross-validation
+    - 3-fold Scanner-Fingerprint StratifiedGroupKFold cross-validation
     - KneeMRIDatasetCached (fast .npz loading) with KneeMRIDataset fallback
     - plane_present mask propagated to KneeMILModel.forward() every step
     - Gradient accumulation (batch x accum_steps -> effective batch 8)
@@ -276,14 +276,14 @@ def train_fold(
     cache_dir: Optional[str] = None,
     dicom_root: Optional[str] = None,
 ) -> dict:
-    """Train one fold of the 5-fold StratifiedGroupKFold cross-validation.
+    """Train one fold of the 3-fold Scanner-Fingerprint StratifiedGroupKFold cross-validation.
 
     Uses KneeMRIDatasetCached (fast) if cache_dir is provided,
     falls back to KneeMRIDataset (slow live DICOM) otherwise.
 
     Args:
-        fold_id:          Validation fold index (0-4).
-        folds_df:         cv_folds_5fold.csv DataFrame.
+        fold_id:          Validation fold index (0-2).
+        folds_df:         cv_folds_3fold.csv DataFrame.
         pseudo_labels_df: pseudo_labels.csv DataFrame (4,407 rows).
         label_cols:       12 label column names from config.yaml.
         weights_dir:      Directory for per-fold model checkpoints.
