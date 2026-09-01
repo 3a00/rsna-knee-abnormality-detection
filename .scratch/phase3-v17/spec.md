@@ -12,17 +12,16 @@ The Phase 3 v16 baseline achieved a solid 3-fold mean Macro ROC-AUC of 0.8008 ±
 ## Solution
 
 A lean, high-impact Phase 3 improvement cycle (v17) that:
-1. Fixes Synovitis AUC evaluation by filtering to gold validation studies with hard binary targets, and adds a fail-fast GPU capability guard in notebook setup.
+1. Fixes Synovitis AUC evaluation by filtering to gold validation studies with hard binary targets.
 2. Activates square-root damped positive loss weighting (`pos_weight`) in `MaskedBCEWithLogitsLoss` to penalize false negatives on rare abnormalities without gradient explosion.
-3. Standardizes on a leak-free 3-Fold Scanner-Fingerprint StratifiedGroupKFold split, fitting full end-to-end training and OOF evaluation within a single 9–10 hour Kaggle T4 session.
+3. Standardizes on a leak-free 3-Fold Scanner-Fingerprint StratifiedGroupKFold split, fitting full end-to-end training and OOF evaluation within a single 9–10 hour Kaggle Tesla T4 session.
 
 ## User Stories
 
 1. As a machine learning practitioner, I want Synovitis validation AUC to be computed on gold ground-truth rows so that I can monitor the model's true discrimination ability across all 12 target labels.
-2. As a competition entrant, I want the Kaggle notebook to detect if an unsupported Pascal GPU (P100) is assigned so that I don't burn GPU quota on instant PyTorch 2.6 kernel crashes.
-3. As a model developer, I want the binary cross-entropy loss to apply square-root scaled `pos_weight` per label so that rare pathologies (like MCL and Fracture) receive sufficient gradient signal to learn effectively.
-4. As an experimentalist, I want training to complete all cross-validation folds within a single Kaggle session (≤ 12 hours) so that I have a complete out-of-fold validation set and full ensemble checkpoints.
-5. As an evaluator, I want out-of-fold gold predictions calibrated via Platt scaling so that final ensemble probabilities are well-calibrated ranking scores.
+2. As a model developer, I want the binary cross-entropy loss to apply square-root scaled `pos_weight` per label so that rare pathologies (like MCL and Fracture) receive sufficient gradient signal to learn effectively.
+3. As an experimentalist, I want training to complete all cross-validation folds on a single Kaggle Tesla T4 GPU within a single session (≤ 12 hours) so that I have a complete out-of-fold validation set and full ensemble checkpoints.
+4. As an evaluator, I want out-of-fold gold predictions calibrated via Platt scaling so that final ensemble probabilities are well-calibrated ranking scores.
 
 ## Implementation Decisions
 
@@ -30,7 +29,6 @@ A lean, high-impact Phase 3 improvement cycle (v17) that:
 - **Loss Rebalancing:** Add `labels.pos_weights` list to `config.yaml` computed via $\sqrt{\text{neg}/\text{pos}}$ on `pseudo_labels.csv`:
   `[2.70, 6.98, 1.21, 2.34, 2.12, 3.01, 1.83, 1.60, 2.94, 2.49, 2.21, 3.55]` (MCL capped at 6.98, all other classes between 1.21 and 3.55). Pass this tensor to `MaskedBCEWithLogitsLoss` in `trainer.py`.
 - **Split Standardization:** Standardize on 3-Fold Scanner-Fingerprint StratifiedGroupKFold (`cv_folds_3fold.csv`), balancing total studies (~1,469/fold) and gold studies (~19–20/fold). Update `config.yaml` `cv.n_folds: 3` and `cv.phase3_final_csv`.
-- **Notebook Fail-Fast Guard:** In notebook Cell 1, check `torch.cuda.get_device_capability(0) >= (7, 0)`, raising an explanatory `RuntimeError` immediately if a P100 (`sm_60`) is encountered.
 - **Ensemble & Calibration:** Train Folds 0, 1, 2 on Kaggle Tesla T4 (single-GPU). Collect OOF gold logits from the best validation epochs to fit Platt scaling temperatures.
 
 ## Testing Decisions

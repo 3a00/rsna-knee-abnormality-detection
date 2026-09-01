@@ -1,7 +1,7 @@
 # 03: Kaggle 3-Fold Training Run and Out-of-Fold Analysis
 
 **What to build:**
-1. Update Kaggle training notebook with Cell 1 GPU capability guard and newly configured 3-fold execution.
+1. Update Kaggle training notebook with newly configured 3-fold execution and `pos_weight` loss.
 2. Execute full 3-fold training on Kaggle Tesla T4 (single-GPU).
 3. Validate training progress: 8 epochs per fold, smooth loss descent, real Synovitis AUC computed every epoch.
 4. Perform post-training OOF analysis: compute 3-fold Mean Macro ROC-AUC vs v16 baseline (0.8008 ± 0.0042), fit Platt temperature scaling on gold OOF logits, and export checkpoints (`fold0_best.pth`, `fold1_best.pth`, `fold2_best.pth`, `platt_temperature.pth`).
