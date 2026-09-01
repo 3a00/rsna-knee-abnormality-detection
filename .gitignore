@@ -33,4 +33,5 @@ outputs/weights/*.onnx
 
 outputs/checkpoint_dataset/
 outputs/weights/
+outputs/codebase_zip/
 .agents/
