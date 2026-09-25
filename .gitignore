@@ -35,3 +35,9 @@ outputs/checkpoint_dataset/
 outputs/weights/
 outputs/codebase_zip/
 .agents/
+
+public_notebooks_research
+chrome search
+kaggle_research
+pulled_notebooks
+RSNA Phase 3 v17 3Fold GPU T4 (logs)
