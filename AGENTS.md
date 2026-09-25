@@ -7,7 +7,6 @@
 - **Host:** Radiological Society of North America (RSNA)
 - **Project Folder:** `/home/wenalz/Documents/Antigravity projects/RSNA_MRI/`
 - **Deadline:** Final submission October 22, 2026 | Team merger deadline October 15, 2026
-- **Prize Pool:** $77,000 (main leaderboard + efficiency track)
 - **Evaluation Metric:** Macro-averaged ROC-AUC across 12 binary knee abnormality labels
 
 ---
@@ -110,7 +109,7 @@ When classifying DICOM series by sequence type and plane, **physics tags are pri
 Used by the Phase 2 AGY multi-agent pipeline (`src/nlp/extractor_agent.py`). LLM API usage is permitted by competition rules (Section 2.6.b). Preferred: Google Gemini Flash.
 
 ```
-You are an expert subspecialty musculoskeletal (MSK) radiologist. Read the following knee MRI
+Read the following knee MRI
 radiology report (written in any language) and extract the exact clinical status for each of
 the 12 target findings below.
 
@@ -157,14 +156,14 @@ Radiology Report:
 
 ---
 
-## Agent Skills & Documentation Index
+## Skills & Documentation Index
 
 ### Domain & Decisions
 - **Domain Model & Glossary:** See [`CONTEXT.md`](CONTEXT.md) for clinical label definitions, 2-slice rule, and silence semantics.
 - **Architecture Decision Records:** See [`docs/adr/`](docs/adr/) for rationale behind core irreversible design decisions.
 - **MSK Clinical Guidelines:** See [`docs/CLINICAL_GUIDELINES.md`](docs/CLINICAL_GUIDELINES.md).
 
-### Issue Tracking & Engineering Skills
+### Issue Tracking & Engineering
 - **Issue tracker:** Local Markdown in `.scratch/`. See [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md).
 - **Triage labels:** Canonical 5-role triage vocabulary. See [`docs/agents/triage-labels.md`](docs/agents/triage-labels.md).
 - **Domain docs consumer rules:** Single-context layout. See [`docs/agents/domain.md`](docs/agents/domain.md).
