@@ -70,6 +70,15 @@ _Avoid_: View angle, arbitrary slice order.
 Constructing a 3-channel image from three consecutive spatial MRI slices (previous, index, next) to preserve volumetric context in 2D backbones.
 _Avoid_: RGB false coloring, 3D voxel tiling.
 
+**Physical Normal Slice Sorting**:
+Establishing 3D spatial slice ordering by projecting the slice position vector onto the normal vector formed by the cross product of orientation cosines ($k = \vec{p} \cdot (\vec{r} \times \vec{c})$), ensuring anatomical ordering invariant to scanner coordinate conventions.
+_Avoid_: Filename sorting, raw InstanceNumber sorting.
+
+**Physical Millimeter FOV Cropping**:
+Cropping an anatomical region of fixed physical dimension (e.g. 140 mm) centered on the knee joint before resizing to decouple anatomical structure scale from scanner pixel spacing.
+_Avoid_: Direct uniform resizing, arbitrary pixel-count cropping.
+
+
 ## Dataset & Label Semantics
 
 **Gold Study**:
@@ -99,3 +108,8 @@ _Avoid_: Test predictions, held-out set logits, full-validation logits.
 **Macro ROC-AUC**:
 The unweighted arithmetic mean of per-label ROC-AUC scores across all 12 target labels. For Synovitis specifically, AUC is computed on Gold Study validation rows only (hard binary 0/1 targets); all other 11 labels are evaluated on all non-NaN validation rows. Labels with only one class present in the validation fold return NaN and are excluded from the mean.
 _Avoid_: Micro-AUC, weighted AUC, softmax probability AUC.
+
+**Efficiency Track**:
+A Kaggle competition submission category evaluating model performance under strict runtime constraints (≤ 30 minutes total inference across ~1,300 test studies on Kaggle T4 GPUs).
+_Avoid_: Main track 9-hour runtime, multi-hour unconstrained ensemble.
+
