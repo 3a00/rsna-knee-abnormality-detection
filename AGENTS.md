@@ -4,9 +4,7 @@
 
 - **Competition:** RSNA 2026 Knee Abnormality Detection (Kaggle Code Competition)
 - **URL:** https://www.kaggle.com/competitions/rsna-knee-abnormality-detection
-- **Host:** Radiological Society of North America (RSNA)
 - **Project Folder:** `/home/wenalz/Documents/Antigravity projects/RSNA_MRI/`
-- **Deadline:** Final submission October 22, 2026 | Team merger deadline October 15, 2026
 - **Evaluation Metric:** Macro-averaged ROC-AUC across 12 binary knee abnormality labels
 
 ---
@@ -79,74 +77,6 @@ RSNA_MRI/
 
 ---
 
-## Gold Study Governance Rules
-
-- **Statistical threshold:** At n=58 gold studies, differences below ~0.02 Macro AUC are statistical noise. Do not treat small deltas as meaningful signal or re-run experiments chasing sub-0.02 improvements.
-- **No extraction overfitting:** Do NOT repeatedly tune Phase 2 extraction prompts against the 58 gold studies. Run concordance validation **once** after extraction is complete. The structural ceiling is ~82.5% (Discussion 05 audit) — reaching 83–85% is best-in-class performance. Do NOT target 90%+.
-- **Gold utilization downstream:** Use gold studies for loss upweighting (5.0× in `MaskedBCEWithLogitsLoss`) and OOF Platt temperature calibration. Do NOT hold them out entirely from training.
-- **Authoritative language distribution:** EN 28, ES 10, TR 6, HR 4, BG 3, EL 3, NL 2, DE 2. Use this for stratified concordance reporting — not the community-estimated EN 45/ES 5/OTHER 8 figures.
-- **Image label is always authoritative:** When a clinical report and the image-derived gold label disagree, the image label wins. This is by competition design (two independent readers + adjudicator on 3D MRI review).
-
----
-
-## DICOM Series Routing Rules (Physics-First)
-
-When classifying DICOM series by sequence type and plane, **physics tags are primary; `SeriesDescription` text is secondary only**.
-
-| Classification | Primary Signal | Secondary Signal |
-|---|---|---|
-| **Fluid-Sensitive vs. Anatomical** | `EchoTime (TE) > 30ms` → T2/fluid-sensitive; low TE + low TR → T1 | `SeriesDescription` keywords (T2, PD_FS, STIR, T1) as confirmation vote only |
-| **Plane (Sagittal / Coronal / Axial)** | `ImageOrientationPatient` DICOM tag | `SeriesDescription` text plane keywords as secondary |
-
-**Why:** Radiographers at 16 international institutions use wildly inconsistent `SeriesDescription` abbreviations across languages and vendors. Physics tags are standardized across all scanners.
-
-**Action:** Spot-check a random sample of 20 routed series visually before training. A systematic routing error silently corrupts all downstream model training.
-
----
-
-## Clinically Calibrated LLM Extraction Prompt
-
-Used by the Phase 2 AGY multi-agent pipeline (`src/nlp/extractor_agent.py`). LLM API usage is permitted by competition rules (Section 2.6.b). Preferred: Google Gemini Flash.
-
-```
-Read the following knee MRI
-radiology report (written in any language) and extract the exact clinical status for each of
-the 12 target findings below.
-
-CRITICAL ANNOTATION RULES (Follow the official RSNA Radiologist Ground-Truth Guidelines):
-1. Golden Rule: Borderline, mild, or ambiguous findings MUST be labeled as 0 (favor high specificity).
-2. acl_tear: 1 ONLY if high-grade partial (>50% fibers disrupted) or full-thickness tear / rupture. Mild degeneration or intact reconstruction = 0.
-3. mcl_tear: 1 ONLY if high-grade partial or complete tear. Low-grade sprain (Grade 1/2) or remote thickening = 0.
-4. medial_meniscus: 1 ONLY if tear contacts articular surface or shows displacement/flap/bucket-handle. Intrasubstance degeneration = 0.
-5. lateral_meniscus: Same criteria as medial meniscus. Intrasubstance degeneration = 0.
-6. medial_oa: 1 ONLY if moderate-to-severe (>1cm area with >50% cartilage thickness loss). Mild thinning = 0.
-7. lateral_oa: Same criteria as medial OA. Mild thinning = 0.
-8. patellofemoral_oa: Same criteria as medial OA. Mild thinning = 0.
-9. joint_effusion: 1 ONLY if moderate or large fluid distension. Trace or physiological fluid = 0.
-10. synovitis: 1 ONLY if marked synovial thickening or inflammatory hypertrophy is described.
-11. bakers_cyst: 1 ONLY if moderate or large popliteal cyst. Tiny incidental bursa fluid = 0.
-12. bone_contusion: 1 ONLY for traumatic marrow edema / impact contusion. Chronic degenerative OA edema = 0.
-13. fracture: 1 ONLY for acute cortical fracture line. Healed remote fracture = 0.
-
-OUTPUT FORMAT: Output ONLY a valid JSON with these EXACT numeric values:
-  1  = The report EXPLICITLY states this finding is present / positive.
-  0  = The report EXPLICITLY states this finding is absent / normal / negative.
- -1  = The report does NOT address or mention this finding at all (silence / unaddressed).
-(Do NOT use 0 for silence — use -1. Reserve 0 only for explicit negations.)
-{
-  "acl_tear": 0, "mcl_tear": 0, "medial_meniscus": 0, "lateral_meniscus": 0,
-  "medial_oa": 0, "lateral_oa": 0, "patellofemoral_oa": 0, "joint_effusion": 0,
-  "synovitis": 0, "bakers_cyst": 0, "bone_contusion": 0, "fracture": 0
-}
-
-Radiology Report:
-{report_text}
-```
-
-**Operational rules:** Rate-limit API calls. Cache all responses to `data/labels/cache/{study_uid}.json`. Never re-call the API for the same study UID.
-
----
-
 ## Supervisor Notes
 
 - The user (wenalz) acts as the **Architect and Supervisor** — they define strategy and review results.
@@ -156,10 +86,11 @@ Radiology Report:
 
 ---
 
-## Skills & Documentation Index
+## Documentation Index
 
 ### Domain & Decisions
 - **Domain Model & Glossary:** See [`CONTEXT.md`](CONTEXT.md) for clinical label definitions, 2-slice rule, and silence semantics.
+- **Gold Study Governance:** See [`docs/GOLD_STUDIES.md`](docs/GOLD_STUDIES.md) for n=58 validation rules, language distribution, and loss weighting.
 - **Architecture Decision Records:** See [`docs/adr/`](docs/adr/) for rationale behind core irreversible design decisions.
 - **MSK Clinical Guidelines:** See [`docs/CLINICAL_GUIDELINES.md`](docs/CLINICAL_GUIDELINES.md).
 
