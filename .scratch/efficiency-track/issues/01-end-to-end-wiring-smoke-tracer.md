@@ -4,11 +4,11 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** completed
 
-- [ ] Synthetic or single-sample test study successfully constructs a 6-slot image tensor of shape `(1, 6, 3, 336, 336)` and presence mask `(1, 6)`.
-- [ ] Model forward pass accepts the 6-slot tensor and presence mask and outputs raw logits of shape `(1, 12)`.
-- [ ] Loss function computes valid, non-NaN loss against continuous soft targets with acute tear silence masked out.
-- [ ] Single optimizer step completes with non-zero parameter gradient updates without device placement mismatch errors.
-- [ ] Mock evaluation produces valid probabilities $[0, 1]$ and writes a smoke test scalar to `outputs/tensorboard/smoke/`.
-- [ ] Script runs cleanly via `python3 scripts/smoke_efficiency_tracer.py` and exits with code 0.
+- [x] Synthetic or single-sample test study successfully constructs a 6-slot image tensor of shape `(1, 6, 3, 336, 336)` and presence mask `(1, 6)`.
+- [x] Model forward pass accepts the 6-slot tensor and presence mask and outputs raw logits of shape `(1, 12)`.
+- [x] Loss function computes valid, non-NaN loss against continuous soft targets with acute tear silence masked out.
+- [x] Single optimizer step completes with non-zero parameter gradient updates without device placement mismatch errors.
+- [x] Mock evaluation produces valid probabilities $[0, 1]$ and writes a smoke test scalar to `outputs/tensorboard/smoke/`.
+- [x] Script runs cleanly via `python3 scripts/smoke_efficiency_tracer.py` and exits with code 0.

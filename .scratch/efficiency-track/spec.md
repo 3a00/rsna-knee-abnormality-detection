@@ -64,12 +64,14 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
 - **Slice Triplets (2.5D)**: For each slot, sample the central anatomical slice $c$ and its immediate neighbors $[c-1, c, c+1]$ stacked into 3 channels. If a sequence is absent, pass a zero-filled tensor and mark presence mask as 0.
 
 ### 4.2 Architecture: DINOv2-Small SlotHead (`src/models/dinov2_slothead.py`)
-- **Encoder**: `timm.create_model("vit_small_patch14_dinov2.lvd1221m", pretrained=True, num_classes=0)` (embedding dim $D=384$, input size 336×336).
+- **Encoder**: `timm.create_model("vit_small_patch14_dinov2.lvd142m", pretrained=True, num_classes=0)` (embedding dim $D=384$, input size 336×336).
 - **SlotHead Cross-Attention Module**:
-  - Input: 6 slot image triplets $\to$ forward through DINOv2 $\to$ slot CLS tokens $S \in \mathbb{R}^{B \times 6 \times D}$.
-  - Learnable Query: $Q \in \mathbb{R}^{12 \times D}$ representing the 12 clinical knee findings.
-  - Multi-head cross-attention ($H=6$ heads): $Q$ attends to $S$ conditioned on sequence presence mask.
-  - Linear classifier projecting attended representations $\mathbb{R}^{B \times 12 \times D} \to \mathbb{R}^{B \times 12}$ (raw logits).
+  - Input: 6 slot image triplets $\to$ zero-gated for absent sequences $\to$ forward through DINOv2 $\to$ slot CLS tokens $S \in \mathbb{R}^{B \times 6 \times D}$.
+  - Slot Identity Embeddings: $E_{\text{slot}} \in \mathbb{R}^{6 \times D}$ injected into $S$ so attention keys possess explicit sequence identity.
+  - Learnable Queries: $Q \in \mathbb{R}^{12 \times D}$ representing the 12 clinical knee findings.
+  - Multi-Head Cross-Attention ($H=6$ heads): $Q$ attends to $(S + E_{\text{slot}})$ with `key_padding_mask` gating absent slots; all-absent studies unmasked to zero-tokens to prevent NaN softmax.
+  - Residual & LayerNorm: $A = \text{LayerNorm}(Q + \text{Attn}(Q, S + E_{\text{slot}}))$.
+  - Per-Finding Classifier Head: $W_{\text{cls}} \in \mathbb{R}^{12 \times D}$ and $b_{\text{cls}} \in \mathbb{R}^{12}$, computing $\text{logits}_f = \langle A_f, W_f \rangle + b_f$, preventing logit collapse across findings.
 - **Model Output**: Strictly raw logits of shape `(batch_size, 12)`. Sigmoid applied only during evaluation/inference.
 
 ### 4.3 Dual-T4 Distributed Execution (`src/training/` & `notebooks/`)
@@ -99,12 +101,11 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
   - `writer.add_pr_curve(f"PR/{Finding_Name}", labels, probs, epoch)` for all 12 findings.
 
 ### 4.5 Training Recipe & Optimization
-- **Loss**: `MaskedBCEWithLogitsLoss` supporting continuous soft targets, NaN masking for acute tear silence, and square-root damped positive class weights:
+- **Loss**: `MaskedBCEWithLogitsLoss` supporting continuous soft targets, NaN masking for acute tear silence, and continuous positive class weighting ($w_f = 1.0 + (\text{pos\_weight}_f - 1.0) \cdot y_f$):
   `pos_weight = [2.70, 6.98, 1.21, 2.34, 2.12, 3.01, 1.83, 1.60, 2.94, 2.49, 2.21, 3.55]`
-- **Optimizer**: AdamW with layer-wise differential learning rates:
-  - Backbone: `3e-5`
-  - SlotHead & Classifier: `1e-3`
-  - Weight Decay: `0.02`
+- **Optimizer**: AdamW with layer-wise differential learning rates and weight decay exclusions:
+  - Backbone: `3e-5` (decay: `0.02` on 2D weights; `0.0` on 1D biases, norms, position tokens)
+  - SlotHead & Classifier: `1e-3` (decay: `0.02` on 2D weights; `0.0` on biases, LayerNorm, query/slot tokens)
 - **Scheduler**: `OneCycleLR` (12 epochs, `pct_start=0.15`, cosine annealing).
 - **Precision & Backend**:
   - `torch.backends.cudnn.benchmark = True`

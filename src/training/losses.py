@@ -50,11 +50,13 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         gold_weight: float = 5.0,
         pos_weight: torch.Tensor | None = None,
         reduction: str = "mean",
+        continuous_pos_weight: bool = True,
     ) -> None:
         super().__init__()
         self.gold_weight = gold_weight
         self.pos_weight  = pos_weight
         self.reduction   = reduction
+        self.continuous_pos_weight = continuous_pos_weight
 
     def forward(
         self,
@@ -87,11 +89,16 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         # Optional per-label positive class weight
         if self.pos_weight is not None:
             pos_w = self.pos_weight.to(logits.device)
-            label_weights = torch.where(
-                safe_targets == 1.0,
-                pos_w.unsqueeze(0).expand_as(logits),
-                torch.ones_like(logits),
-            )
+            if self.continuous_pos_weight:
+                # Continuous interpolation: 1.0 at target=0.0, pos_weight at target=1.0
+                label_weights = 1.0 + (pos_w.unsqueeze(0).expand_as(logits) - 1.0) * safe_targets
+            else:
+                # Legacy discrete binary weighting (retains v16 bit-for-bit equivalence)
+                label_weights = torch.where(
+                    safe_targets == 1.0,
+                    pos_w.unsqueeze(0).expand_as(logits),
+                    torch.ones_like(logits),
+                )
             sample_weights = sample_weights * label_weights
 
         # Raw BCE (no reduction) then apply mask and sample weights
@@ -100,13 +107,10 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         )  # (B, 12)
         weighted = bce * sample_weights * valid_mask.float()  # zero out NaN cells
 
+        # Branchless normalization: avoids GPU-host synchronization while keeping graph connected on all-NaN
         n_valid = valid_mask.float().sum()
-        if n_valid == 0:
-            # Edge case: entire batch has no valid labels (unlikely but safe)
-            return torch.tensor(0.0, device=logits.device, requires_grad=True)
-
         if self.reduction == "mean":
-            return weighted.sum() / n_valid
+            return weighted.sum() / n_valid.clamp_min(1.0)
         return weighted.sum()
 
 

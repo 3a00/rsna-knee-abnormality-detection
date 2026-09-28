@@ -83,6 +83,7 @@ RSNA_MRI/
 - The AI agent writes all Python code, notebooks, scripts, and debugging fixes.
 - Always explain design decisions clearly before implementing them.
 - When proposing a new experiment or approach, present it as a short plan first and wait for approval.
+- **Review Packaging (`/package`):** When asked to package an issue for review and write or implement code for it, write the complete proposed implementation *strictly inside the review document* (`docs/llm review/`) using the requested skill (e.g. `yagni full`). Do **not** implement, touch, or run code in the active repository until the review feedback has been received and approved.
 
 ---
 
