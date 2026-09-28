@@ -28,11 +28,6 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import pandas as pd
 import torch
-
-# Set reproducible seeds at script initialization (AGENTS.md standard)
-random.seed(42)
-np.random.seed(42)
-torch.manual_seed(42)
 from src.datasets.efficiency_pipeline import (
     BUDGET_S,
     SLOT_NAMES,
@@ -40,6 +35,11 @@ from src.datasets.efficiency_pipeline import (
     parse_dicom_header_fast,
     process_study_to_6slot,
 )
+
+# Set reproducible seeds at script initialization (AGENTS.md standard)
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
 
 
 def _time_chunk(args: tuple[list[Path], Any, int]) -> float:
