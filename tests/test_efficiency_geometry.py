@@ -566,3 +566,54 @@ def test_full_study_6slot_processing_and_absent_slot_mask():
         assert not torch.all(tensor[0] == 0.0)
         assert not torch.all(tensor[4] == 0.0)
         assert torch.all(torch.isfinite(tensor))
+
+
+def test_n1_series_reaches_slot_via_edge_replication():
+    """Assert a 1-slice series (N=1) is edge-replicated to fill a slot instead of being discarded."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        study_dir = Path(tmp_dir) / "study_n1"
+        study_dir.mkdir()
+        s_dir = study_dir / "series_single"
+        s_dir.mkdir()
+        s_uid = generate_uid()
+
+        # Only ONE slice — previously discarded by N<3 guard, must now reach the slot
+        create_synthetic_dicom_file(
+            s_dir / "slice_0.dcm",
+            study_uid=generate_uid(),
+            series_uid=s_uid,
+            instance_number=1,
+            iop=[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ipp=[0.0, 0.0, 0.0],
+            pixel_spacing=[0.4, 0.4],
+            series_desc="AX T2 FS",
+            echo_time=40.0,
+        )
+
+        tensor, mask, stats = process_study_to_6slot(study_dir, num_workers=0, return_stats=True)
+        # N=1 must reach the slot (Slot 2 = AX_FLUID_FS) via edge replication
+        assert mask[2].item() == 1.0, f"N=1 series was discarded; stats={stats}"
+        assert tensor.shape == (6, 3, 336, 336)
+        assert torch.all(torch.isfinite(tensor))
+
+
+def test_padded_zeros_stay_zero_after_normalization():
+    """Assert zero-padded borders (small FOV < 140mm) remain exactly 0.0 after ImageNet standardization."""
+    # 0.5 mm/px, 200px image = 100 mm physical < 140 mm → will be padded
+    ps = (0.5, 0.5)
+    img_small = np.zeros((3, 200, 200), dtype=np.float32)
+    img_small[:, 50:150, 50:150] = 1000.0  # signal in the center only
+
+    cropped, mask = crop_and_resize_140mm(img_small, ps, target_size=336, crop_mm=140.0)
+    # mask must have False regions (the padded border)
+    assert not np.all(mask), "Expected some False (padded) pixels in mask"
+
+    normed, is_valid = normalize_triplet_dinov2(cropped, valid_mask=mask)
+    assert is_valid is True
+
+    # All padded regions must be exactly 0.0 — not ~-2.12 from ImageNet standardization
+    padded_pixels = normed[:, ~mask]
+    assert np.all(padded_pixels == 0.0), (
+        f"Padded border pixels are not 0.0 after normalization: "
+        f"min={padded_pixels.min():.4f}, max={padded_pixels.max():.4f}"
+    )

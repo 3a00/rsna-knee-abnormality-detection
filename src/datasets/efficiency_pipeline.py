@@ -12,7 +12,6 @@ Only 18 DICOM pixel arrays are decoded per study.
 from __future__ import annotations
 
 import concurrent.futures
-import os
 import re
 import warnings
 from dataclasses import dataclass
@@ -383,7 +382,13 @@ def normalize_triplet_dinov2(
     triplet: np.ndarray,
     valid_mask: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, bool]:
-    """Per-volume percentile normalization [0.5, 99.5] followed by ImageNet standardization."""
+    """Per-volume percentile normalization [0.5, 99.5] followed by ImageNet standardization.
+
+    Percentile range is computed strictly on unpadded valid pixels (when valid_mask is
+    provided) so zero-padded borders do not skew contrast. After standardization, padded
+    regions are explicitly re-zeroed so the model sees exactly 0.0 in absent spatial
+    areas rather than the standardized value of a zero pixel (~-2.12).
+    """
     if valid_mask is not None and np.any(valid_mask):
         unpadded_pixels = triplet[:, valid_mask]
     else:
@@ -397,6 +402,13 @@ def normalize_triplet_dinov2(
     normed = np.clip((triplet - p_low) / (p_high - p_low), 0.0, 1.0)
     standardized = (normed - IMAGENET_MEAN) / IMAGENET_STD
     cleaned = np.nan_to_num(standardized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    # Re-zero padded borders: zero-padding maps to a non-zero standardized value
+    # (~-2.12 with ImageNet mean/std). Force padded regions back to exactly 0.0
+    # so absent spatial areas are clean zeros for the model.
+    if valid_mask is not None and not np.all(valid_mask):
+        cleaned[:, ~valid_mask] = 0.0
+
     return cleaned, True
 
 
@@ -557,7 +569,11 @@ def process_study_to_6slot(
         if slot is not None:
             deduped_slices = deduplicate_multi_echo_slices(s_headers)
             unique_k_cnt = len(deduped_slices)
-            if unique_k_cnt < 3:
+            # Only skip true empty series (scouts with 0 usable slices).
+            # N=1 and N=2 are allowed through: select_triplet_paths edge-replicates them
+            # per spec (handover §4). They rank low on unique_k_cnt so only fill a slot
+            # if no better candidate exists.  # yagni: N>=3 filter was wrong; N>=1 is the floor
+            if unique_k_cnt < 1:
                 stats["short_series"] += 1
                 continue
 
