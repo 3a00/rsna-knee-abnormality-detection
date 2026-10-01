@@ -27,6 +27,14 @@
 > [!IMPORTANT]
 > **NEVER hardcode absolute file paths** inside `src/` modules. Always reference `config.yaml` or function arguments.
 
+> [!CAUTION]
+> **NEVER push `private-work` to GitHub (`origin`).**
+> - The GitHub remote (`origin/main`) is public.
+> - `main` tracks ONLY clean code (`src/`, `scripts/`, `tests/`, `config.yaml`, `CONTEXT.md`, `.gitignore`). All data, outputs, notebooks, docs, and scratch files are ignored and scrubbed from history.
+> - `private-work` is strictly for local development and tracking of full files.
+> - Sync to GitHub ONLY via:
+>   `git checkout main && git checkout private-work -- src scripts tests config.yaml && git commit -m "sync" && git push origin main && git checkout private-work`
+
 ---
 
 ## Repository Structure
@@ -74,6 +82,29 @@ RSNA_MRI/
 ### File Categorization & Naming
 1. **Production Core Files:** Reside strictly in `src/`, `scripts/`, `data/`, `notebooks/`, `docs/`, `outputs/` with clean permanent names.
 2. **Temporary / Scratch / Probing Files:** Any exploratory script MUST be prefixed with `tmp_` or `scratch_`, start with `# [TEMPORARY / SCRATCH FILE — NOT FOR PRODUCTION]`, and can be safely deleted at any time.
+
+---
+
+## Git Branch Strategy & Remote Synchronization
+
+The project operates under a strict two-branch model:
+
+| Branch | Location | Purpose | Tracked Content |
+|---|---|---|---|
+| `private-work` | **Local only** | Daily development, experiments, notes | Everything (`notebooks/`, `docs/`, `.scratch/`, `AGENTS.md`, code) |
+| `main` | **Local & GitHub (`origin/main`)** | Public release mirror | Only production code (`src/`, `scripts/`, `tests/`, `config.yaml`, `CONTEXT.md`, `.gitignore`) |
+
+### Synchronization Rules
+- **NEVER** push `private-work` to `origin` (`git push origin private-work` is strictly forbidden).
+- To push code changes to GitHub:
+  ```bash
+  git checkout main
+  git checkout private-work -- src scripts tests config.yaml
+  git commit -m "feat: sync public code updates"
+  git push origin main
+  git checkout private-work
+  ```
+- All competition data (`data/`), checkpoints (`outputs/`), exploratory notebooks (`notebooks/`), and strategy documents (`docs/`, `.scratch/`, `AGENTS.md`) are ignored on `main` and permanently scrubbed from remote git history.
 
 ---
 
