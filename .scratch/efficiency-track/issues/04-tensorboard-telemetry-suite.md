@@ -4,12 +4,11 @@
 
 **Blocked by:** 01: End-to-End Wiring Smoke Tracer
 
-**Status:** ready-for-agent
-
-- [ ] `TensorBoardLogger` and `NoOpLogger` implement a shared protocol so consumers can log without coupling to TensorBoard availability.
-- [ ] Model architecture graph is logged via `writer.add_graph` using a dummy `(1, 6, 3, 336, 336)` tensor without crashing or serialization errors.
-- [ ] Scalars for training step loss, epoch train/val loss, learning rates, and Macro ROC-AUC are logged and readable in the TensorBoard dashboard.
-- [ ] Per-label ROC-AUC scalars are logged individually for all 12 abnormalities, enforcing Gold Study filtering for Synovitis and non-NaN masking for other labels.
-- [ ] At validation epoch end, attention weights across the 12 findings and 6 slots are rendered into a labeled matplotlib heatmap figure and logged via `writer.add_figure`.
-- [ ] Precision-recall curves for each finding are logged at epoch completion via `writer.add_pr_curve`.
-- [ ] Unit tests in `tests/test_tensorboard_logging.py` verify all logging methods write without error and handle edge cases (e.g., all-zero predictions, missing labels).
+**Status:** completed
+- [x] `TensorBoardLogger` and `NoOpLogger` implement a shared protocol so consumers can log without coupling to TensorBoard availability.
+- [x] Model architecture graph is logged via `writer.add_graph` using a dummy `(1, 6, 3, 336, 336)` tensor without crashing or serialization errors.
+- [x] Scalars for training step loss, epoch train/val loss, learning rates, and Macro ROC-AUC are logged and readable in the TensorBoard dashboard.
+- [x] Per-label ROC-AUC scalars are logged individually for all 12 abnormalities, enforcing Gold Study filtering for Synovitis and non-NaN masking for other labels.
+- [x] At validation epoch end, attention weights across the 12 findings and 6 slots are rendered into a labeled matplotlib heatmap figure and logged via `writer.add_figure`.
+- [x] Precision-recall curves for each finding are logged at epoch completion via `writer.add_pr_curve`.
+- [x] Unit tests in `tests/test_tensorboard_logging.py` verify all logging methods write without error and handle edge cases (e.g., all-zero predictions, missing labels).
