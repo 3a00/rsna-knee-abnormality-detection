@@ -11,16 +11,17 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Heavy Data & Caches (Keep local/on Kaggle, not on GitHub)
-data/raw/*.dcm
-data/labels/cache/
-data/rsna.db
+# Heavy Data & Caches
+data/
 
 # Heavy Model Checkpoints & Large Outputs
-outputs/weights/*.pth
-outputs/weights/*.bin
-outputs/weights/*.pt
-outputs/weights/*.onnx
+outputs/
+
+# Notebooks & Documentation & Scratch
+notebooks/
+docs/
+.scratch/
+AGENTS.md
 
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints/
@@ -30,12 +31,7 @@ outputs/weights/*.onnx
 .DS_Store
 *.log
 
-
-outputs/checkpoint_dataset/
-outputs/weights/
-outputs/codebase_zip/
 .agents/
-
 public_notebooks_research
 chrome search
 kaggle_research
