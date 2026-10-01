@@ -67,6 +67,7 @@ outputs:
   weights_dir: "outputs/weights"
   logs_dir: "outputs/logs"
   submissions_dir: "outputs/submissions"
+  tensorboard_dir: "outputs/tensorboard"
 
 nlp:
   # Model identifiers — read dynamically by orchestrator
