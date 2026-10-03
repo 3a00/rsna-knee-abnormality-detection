@@ -1,0 +1,774 @@
+"""scripts/train_ddp_efficiency.py
+
+Dual-T4 DistributedDataParallel (DDP) Training Runner for RSNA Knee Abnormality Detection.
+Wraps the single-GPU training engine in PyTorch DDP across both Kaggle Tesla T4 GPUs.
+Supports both torchrun launcher and direct python mp.spawn execution.
+
+Single-Responsibility Module: Distributed process orchestration, sampler synchronization,
+inter-GPU gradient/loss reduction, and rank-isolated telemetry/checkpointing.
+
+Troubleshooting Note:
+    If running on Kaggle Dual Tesla T4 GPUs and distributed initialization hangs during
+    initial inter-GPU P2P handshakes over the PCIe bus, export NCCL_P2P_DISABLE=1 in your environment.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import nullcontext
+from datetime import timedelta
+import functools
+import itertools
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import socket
+import sys
+from typing import Any
+
+# Ensure project root is first on sys.path for direct python and torchrun invocations
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Ensure local user site packages can be discovered as fallback if not present (e.g. for matplotlib)
+try:
+    import matplotlib  # type: ignore
+except ImportError:
+    user_site = Path.home() / f".local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    if user_site.is_dir() and str(user_site) not in sys.path:
+        sys.path.append(str(user_site))
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+from src.datasets.efficiency_pipeline import SLOT_NAMES
+from src.models.dinov2_slothead import DINOv2SlotHead
+from src.training.losses import MaskedBCEWithLogitsLoss
+from src.training.metrics import MetricsResult, compute_competition_metrics
+from src.training.train_efficiency import (
+    EfficiencyStudyDataset,
+    _register_checkpoint,
+    _seed_worker,
+    average_top_checkpoints,
+    build_differential_optimizer,
+    collate_efficiency,
+    load_labels_and_splits,
+    load_pos_weights,
+    seed_everything,
+)
+from src.utils.tensorboard import NoOpLogger, TelemetryLogger, TensorBoardLogger
+
+logger = logging.getLogger("train_ddp_efficiency")
+
+
+def _find_free_port() -> int:
+    """Find an available port on localhost for distributed process group initialization."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return int(s.getsockname()[1])
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """Unwrap DistributedDataParallel or DataParallel wrapper to access base module.
+
+    Args:
+        model: Wrapped or unwrapped PyTorch module.
+
+    Returns:
+        The underlying unwrapped nn.Module.
+    """
+    return model.module if isinstance(model, (DDP, nn.DataParallel)) else model
+
+
+def setup_ddp(
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    backend: str | None = None,
+    timeout_minutes: int = 30,
+) -> torch.device:
+    """Initialize distributed process group and set active device.
+
+    Args:
+        rank: Global worker rank (0 to world_size - 1).
+        local_rank: Local GPU device index.
+        world_size: Total number of worker processes.
+        backend: PyTorch distributed backend ('nccl' for CUDA, 'gloo' for CPU).
+        timeout_minutes: Timeout in minutes before process group aborts on deadlock (default: 30).
+
+    Returns:
+        The active torch.device for this worker.
+    """
+    cuda = torch.cuda.is_available()
+    chosen_backend = backend or ("nccl" if cuda else None)
+    if chosen_backend is None or (chosen_backend == "nccl" and not cuda):
+        raise RuntimeError("No usable CUDA device; pass --backend gloo explicitly for CPU runs.")
+
+    if chosen_backend == "nccl":
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.backends.cudnn.benchmark = True
+    else:
+        device = torch.device("cpu")
+
+    dist.init_process_group(
+        backend=chosen_backend,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(minutes=timeout_minutes),
+    )
+    return device
+
+
+def cleanup_ddp() -> None:
+    """Destroy distributed process group cleanly if initialized."""
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def gather_unique_records(
+    local_records: list[dict[str, Any]],
+    world_size: int,
+) -> list[dict[str, Any]]:
+    """Gather prediction records across DDP workers and deduplicate DistributedSampler padding.
+
+    Args:
+        local_records: List of prediction dictionaries generated by current worker.
+        world_size: Total number of distributed workers.
+
+    Returns:
+        Deduplicated list of prediction records across all workers.
+    """
+    gathered: list[list[dict[str, Any]] | None] = [None] * world_size
+    dist.all_gather_object(gathered, local_records)
+    unique: dict[str, dict[str, Any]] = {}
+    for rec in itertools.chain.from_iterable(g for g in gathered if g is not None):
+        unique.setdefault(rec["uid"], rec)  # First occurrence wins (DistributedSampler repeats at end)
+    return list(unique.values())
+
+
+@torch.no_grad()
+def run_ddp_validation(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    use_amp: bool,
+    world_size: int,
+    label_cols: list[str],
+) -> tuple[float, MetricsResult]:
+    """Run validation across DDP workers and gather predictions without padding duplication.
+
+    Args:
+        model: Model module (raw or DDP wrapped).
+        loader: DataLoader with DistributedSampler(shuffle=False).
+        criterion: MaskedBCEWithLogitsLoss instance.
+        device: Active torch device.
+        use_amp: Whether to run validation under FP16 autocast.
+        world_size: Number of distributed workers.
+        label_cols: 12 abnormality column names.
+
+    Returns:
+        Tuple of (global_val_loss, unified_metrics).
+    """
+    model.eval()
+    val_loss_total = 0.0
+    val_samples = 0
+    local_records: list[dict[str, Any]] = []
+
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True).float()
+        masks = batch["presence_mask"].to(device, non_blocking=True)
+        targets = batch["labels"].to(device, non_blocking=True)
+        is_gold = batch["is_gold"].to(device, non_blocking=True)
+        uids = batch.get("study_uid") or batch.get("study_id")
+        assert uids is not None, "Batch missing study_uid or study_id key"
+
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(use_amp and device.type == "cuda")):
+            logits = model(images, masks)
+            loss = criterion(logits.float(), targets, is_gold)
+
+        val_loss_total += loss.item() * len(targets)
+        val_samples += len(targets)
+
+        logits_cpu = logits.float().cpu()
+        targets_cpu = targets.float().cpu()
+        gold_cpu = is_gold.cpu()
+
+        for i, uid in enumerate(uids):
+            # Clone tensors to prevent serializing whole batch storage over IPC
+            local_records.append({
+                "uid": str(uid),
+                "logits": logits_cpu[i].clone(),
+                "targets": targets_cpu[i].clone(),
+                "is_gold": int(gold_cpu[i].item()),
+            })
+
+    # 1. Reduce validation loss across all workers
+    loss_tensor = torch.tensor([val_loss_total, float(val_samples)], device=device, dtype=torch.float32)
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+    global_val_loss = (loss_tensor[0] / max(1.0, loss_tensor[1])).item()
+
+    # 2. Gather prediction objects across all workers and deduplicate padding
+    unique_records = gather_unique_records(local_records, world_size)
+
+    if unique_records:
+        concat_logits = torch.stack([item["logits"] for item in unique_records], dim=0)
+        concat_targets = torch.stack([item["targets"] for item in unique_records], dim=0)
+        concat_gold = torch.tensor([item["is_gold"] for item in unique_records], dtype=torch.long)
+        metrics = compute_competition_metrics(
+            logits=concat_logits,
+            targets=concat_targets,
+            gold_mask=concat_gold.bool(),
+            label_cols=label_cols,
+        )
+    else:
+        metrics = MetricsResult(
+            macro_auc_12=float("nan"),
+            macro_auc_11=float("nan"),
+            per_label_auc={},
+            per_label_ap={},
+            label_stats={},
+            n_valid_labels=0,
+            n_non_finite_logits=0,
+        )
+
+    return global_val_loss, metrics
+
+
+def train_ddp_worker(
+    rank: int,
+    local_rank: int,
+    world_size: int,
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    """Worker process function executed on each distributed GPU/CPU process.
+
+    Args:
+        rank: Global worker rank (0 to world_size - 1).
+        local_rank: Local GPU or device index.
+        world_size: Total number of distributed processes.
+        args: Parsed command-line arguments.
+
+    Returns:
+        Results dictionary on rank 0, or None on non-zero ranks.
+    """
+    device = setup_ddp(rank=rank, local_rank=local_rank, world_size=world_size, backend=args.backend, timeout_minutes=30)
+    is_rank0 = (rank == 0)
+
+    # Prevent CPU oversubscription on Kaggle's 4 vCPUs
+    torch.set_num_threads(2)
+
+    # Configure logging
+    if is_rank0:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [Rank 0] %(message)s")
+    else:
+        logging.basicConfig(level=logging.WARNING, format=f"%(asctime)s [Rank {rank}] %(message)s")
+
+    seed_everything(args.seed + rank)
+
+    ckpt_dir = Path(args.weights_dir)
+    if is_rank0:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Telemetry setup (Rank 0 gets real writer; non-zero ranks get NoOpLogger)
+    logger_instance: TelemetryLogger = NoOpLogger()
+    if is_rank0 and args.tb_dir:
+        try:
+            logger_instance = TensorBoardLogger(args.tb_dir)
+        except Exception as err:
+            logger.warning("TensorBoard unavailable (%s); falling back to NoOpLogger.", err)
+            logger_instance = NoOpLogger()
+
+    # Load splits & labels
+    labels_file = args.labels_path or (
+        PROJECT_ROOT / "data/labels/labels_soft.parquet"
+        if (PROJECT_ROOT / "data/labels/labels_soft.parquet").is_file()
+        else PROJECT_ROOT / "data/labels/pseudo_labels.csv"
+    )
+    splits_file = args.splits_path or (PROJECT_ROOT / "data/splits/cv_folds_3fold.csv")
+    train_df, val_df, label_cols = load_labels_and_splits(
+        labels_path=labels_file,
+        splits_path=splits_file,
+        fold_id=args.fold,
+    )
+
+    # Optional dry-run subsetting preserving gold studies
+    def _subset(df: pd.DataFrame, n: int | None, s: int) -> pd.DataFrame:
+        if n is None or n >= len(df):
+            return df
+        gold = df[df["is_gold"] == 1]
+        rest = df[df["is_gold"] != 1].sample(n=max(0, n - len(gold)), random_state=s)
+        return pd.concat([gold, rest]).sample(frac=1.0, random_state=s).head(n).reset_index(drop=True)
+
+    train_df = _subset(train_df, args.limit_train, args.seed)
+    val_df = _subset(val_df, args.limit_val, args.seed)
+
+    def resolve_study_dirs(df: pd.DataFrame) -> list[Path]:
+        dirs: list[Path] = []
+        for uid in df["StudyInstanceUID"]:
+            primary = Path(args.dicom_root or PROJECT_ROOT / "data/raw") / "train_series" / str(uid)
+            fallback = Path(args.dicom_root or PROJECT_ROOT / "data/raw") / str(uid)
+            dirs.append(primary if primary.is_dir() else fallback)
+        return dirs
+
+    train_dirs = resolve_study_dirs(train_df)
+    val_dirs = resolve_study_dirs(val_df)
+
+    series_csv_file = args.series_csv or (
+        PROJECT_ROOT / "data/raw/train_series.csv"
+        if (PROJECT_ROOT / "data/raw/train_series.csv").is_file()
+        else None
+    )
+
+    train_ds = EfficiencyStudyDataset(
+        study_uids=train_df["StudyInstanceUID"].tolist(),
+        study_dirs=train_dirs,
+        labels=train_df[label_cols].values,
+        is_gold=train_df["is_gold"].values,
+        series_csv_path=series_csv_file,
+        target_size=args.img_size,
+        cached_tensor_dir=args.cache_dir,
+        num_workers=args.num_workers,
+    )
+    val_ds = EfficiencyStudyDataset(
+        study_uids=val_df["StudyInstanceUID"].tolist(),
+        study_dirs=val_dirs,
+        labels=val_df[label_cols].values,
+        is_gold=val_df["is_gold"].values,
+        series_csv_path=series_csv_file,
+        target_size=args.img_size,
+        cached_tensor_dir=args.cache_dir,
+        num_workers=args.num_workers,
+    )
+
+    # Shard studies across workers
+    train_sampler = DistributedSampler(
+        train_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=True,
+        seed=args.seed,
+        drop_last=False,
+    )
+    val_sampler = DistributedSampler(
+        val_ds,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
+        collate_fn=collate_efficiency,
+        num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=2 if args.num_workers > 0 else None,
+        worker_init_fn=functools.partial(_seed_worker, base_seed=args.seed + rank * 100),
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        sampler=val_sampler,
+        collate_fn=collate_efficiency,
+        num_workers=args.num_workers,
+        persistent_workers=False,
+        worker_init_fn=functools.partial(_seed_worker, base_seed=args.seed + rank * 100),
+        pin_memory=(device.type == "cuda"),
+        drop_last=False,
+    )
+
+    # Prior bias initialization (NaN-masked soft labels handled accurately)
+    pos_priors = np.clip(
+        np.nan_to_num(np.nanmean(train_df[label_cols].values.astype(float), axis=0), nan=0.15),
+        1e-4,
+        1.0 - 1e-4,
+    )
+
+    # Instantiate model
+    model = DINOv2SlotHead(
+        pretrained=False,
+        weights_path=str(args.weights_path) if args.weights_path else None,
+        img_size=args.img_size,
+        init_bias_priors=pos_priors,
+        slot_dropout_p=0.15,
+    ).to(device)
+
+    # Wrap model in DistributedDataParallel
+    if device.type == "cuda":
+        ddp_model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
+        )
+    else:
+        ddp_model = DDP(model, find_unused_parameters=False)
+
+    raw_model = unwrap_model(ddp_model)
+
+    # Loss function with positive class weighting
+    raw_pos_weights = load_pos_weights(args.config_path)
+    pos_weights_tensor = torch.as_tensor(raw_pos_weights, dtype=torch.float32, device=device)
+    criterion = MaskedBCEWithLogitsLoss(
+        gold_weight=args.gold_weight,
+        pos_weight=pos_weights_tensor,
+        continuous_pos_weight=True,
+    )
+
+    # Optimizer wraps raw parameters (ddp_model shares identical parameter instances)
+    optimizer = build_differential_optimizer(
+        model=raw_model,
+        lr_backbone=args.lr_backbone,
+        lr_head=args.lr_head,
+        weight_decay=args.weight_decay,
+    )
+    assert len(optimizer.param_groups) == 4, "Optimizer must contain exactly 4 differential parameter groups."
+
+    steps_per_epoch = math.ceil(len(train_loader) / max(1, args.grad_accum_steps))
+    total_steps = max(1, steps_per_epoch * args.epochs)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=[args.lr_backbone, args.lr_backbone, args.lr_head, args.lr_head],
+        total_steps=total_steps,
+        pct_start=args.pct_start,
+    )
+
+    scaler = torch.amp.GradScaler("cuda", init_scale=1024.0, enabled=(args.use_amp and device.type == "cuda"))
+
+    top_checkpoints: list[tuple[float, int, Path]] = []
+    history: list[dict[str, Any]] = []
+    global_step = 0
+    sample_val_batch = None  # Built lazily on rank 0 to avoid DDP construction latency
+
+    if is_rank0:
+        logger.info(
+            "Launched DDP training on %d workers (Device: %s) for %d epochs.",
+            world_size,
+            device,
+            args.epochs,
+        )
+
+    for epoch in range(1, args.epochs + 1):
+        ddp_model.train()
+        train_sampler.set_epoch(epoch)
+        train_loss_acc = torch.zeros((), device=device)
+        train_samples = 0
+        optimizer.zero_grad(set_to_none=True)
+
+        for step_idx, batch in enumerate(train_loader):
+            images = batch["image"].to(device, non_blocking=True).float()
+            masks = batch["presence_mask"].to(device, non_blocking=True)
+            targets = batch["labels"].to(device, non_blocking=True)
+            is_gold = batch["is_gold"].to(device, non_blocking=True)
+
+            # Suppress DDP AllReduce on intermediate gradient accumulation steps
+            is_accumulating = ((step_idx + 1) % args.grad_accum_steps != 0) and (step_idx + 1 < len(train_loader))
+            sync_context = ddp_model.no_sync() if is_accumulating else nullcontext()
+
+            with sync_context:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=(args.use_amp and device.type == "cuda")):
+                    logits = ddp_model(images, masks)
+                    loss = criterion(logits.float(), targets, is_gold)
+                    if args.grad_accum_steps > 1:
+                        loss = loss / args.grad_accum_steps
+
+                scaler.scale(loss).backward()
+
+            is_last_step = (step_idx + 1 == len(train_loader))
+            if (step_idx + 1) % args.grad_accum_steps == 0 or is_last_step:
+                if args.grad_clip_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), args.grad_clip_norm)
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
+            # Asynchronous loss accumulation on GPU (no per-step host syncs)
+            grad_scale = float(args.grad_accum_steps if args.grad_accum_steps > 1 else 1.0)
+            train_loss_acc += loss.detach() * grad_scale * len(targets)
+            train_samples += len(targets)
+            global_step += 1
+
+            # Read loss.item() strictly on logging steps on rank 0
+            is_logging_step = (global_step % 10 == 0 or is_last_step)
+            if is_rank0 and is_logging_step:
+                raw_loss_val = loss.item() * grad_scale
+                current_lrs = {
+                    "backbone": optimizer.param_groups[0]["lr"],
+                    "slothead": optimizer.param_groups[2]["lr"],
+                }
+                logger_instance.log_step(step=global_step, loss=raw_loss_val, lrs=current_lrs)
+
+        # Compute global epoch training loss across workers via single collective
+        train_loss_tensor = torch.stack([train_loss_acc, torch.tensor(float(train_samples), device=device)])
+        dist.all_reduce(train_loss_tensor, op=dist.ReduceOp.SUM)
+        epoch_train_loss = (train_loss_tensor[0] / max(1.0, train_loss_tensor[1])).item()
+
+        # Distributed validation
+        epoch_val_loss, metrics = run_ddp_validation(
+            model=raw_model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+            use_amp=args.use_amp,
+            world_size=world_size,
+            label_cols=label_cols,
+        )
+
+        if is_rank0:
+            logger_instance.log_epoch(
+                epoch=epoch,
+                train_loss=epoch_train_loss,
+                val_loss=epoch_val_loss,
+                metrics=metrics,
+            )
+
+            # Diagnostic attention heatmap logging strictly on rank 0 with raw_model (never ddp_model)
+            if epoch == 1 or epoch == args.epochs or epoch % 3 == 0:
+                if sample_val_batch is None and len(val_ds) > 0:
+                    gold_idx = [i for i, g in enumerate(val_df["is_gold"].values) if g == 1][:8]
+                    if not gold_idx:
+                        gold_idx = list(range(min(4, len(val_ds))))
+                    sample_val_batch = collate_efficiency([val_ds[i] for i in gold_idx])
+
+                if sample_val_batch is not None:
+                    with torch.no_grad():
+                        s_img = sample_val_batch["image"].to(device).float()
+                        s_mask = sample_val_batch["presence_mask"].to(device)
+                        _, s_attn = raw_model.forward_with_attention(s_img, s_mask)
+                        logger_instance.log_attention_heatmap(
+                            attn_weights=s_attn.float().cpu().numpy(),
+                            step=epoch,
+                            presence_mask=s_mask.cpu().numpy(),
+                            slot_names=SLOT_NAMES,
+                            label_cols=label_cols,
+                        )
+
+            score = float(metrics.macro_auc_11)
+            if math.isnan(score):
+                score = -float(epoch_val_loss)
+
+            # Checkpoints strictly unwrap model (no 'module.' prefix)
+            ckpt_file = ckpt_dir / f"checkpoint_epoch_{epoch:02d}.pth"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": raw_model.state_dict(),
+                    "macro_auc_12": float(metrics.macro_auc_12),
+                    "macro_auc_11": float(metrics.macro_auc_11),
+                    "val_loss": float(epoch_val_loss),
+                },
+                ckpt_file,
+            )
+
+            _register_checkpoint(top_checkpoints, score, epoch, ckpt_file, k=3)
+
+            history.append({
+                "epoch": epoch,
+                "train_loss": float(epoch_train_loss),
+                "val_loss": float(epoch_val_loss),
+                "macro_auc_11": float(metrics.macro_auc_11),
+                "macro_auc_12": float(metrics.macro_auc_12),
+                "score": float(score),
+            })
+
+            logger.info(
+                "Epoch %02d/%02d | Train Loss: %.4f | Val Loss: %.4f | Macro-12: %.4f | Macro-11: %.4f | Score: %.4f",
+                epoch,
+                args.epochs,
+                epoch_train_loss,
+                epoch_val_loss,
+                metrics.macro_auc_12,
+                metrics.macro_auc_11,
+                score,
+            )
+
+    # Post-training: Average top-3 checkpoints on rank 0, broadcast status, then re-evaluate collectively
+    ensemble_path = ckpt_dir / "dinov2_slothead_top3.pth"
+    top3_paths = [item[2] for item in top_checkpoints[:3]] if is_rank0 else []
+    averaging_ok = [True]
+
+    if is_rank0:
+        try:
+            average_top_checkpoints(top3_paths, ensemble_path)
+        except Exception:
+            logger.exception("Averaging top-3 checkpoints failed.")
+            averaging_ok = [False]
+
+    # Collective broadcast serves as both synchronization point and status agreement
+    if dist.is_available() and dist.is_initialized():
+        dist.broadcast_object_list(averaging_ok, src=0)
+
+    # Re-evaluate averaged model on ALL ranks collectively (gated strictly on averaging_ok to prevent filesystem lag deadlocks)
+    averaged_metrics: MetricsResult | None = None
+    if averaging_ok[0]:
+        raw_model.load_state_dict(torch.load(ensemble_path, map_location=device, weights_only=True))
+        _, averaged_metrics = run_ddp_validation(
+            model=raw_model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+            use_amp=args.use_amp,
+            world_size=world_size,
+            label_cols=label_cols,
+        )
+        if is_rank0 and averaged_metrics is not None:
+            logger.info(
+                "Averaged Top-3 Ensemble Validation | Macro-12: %.4f | Macro-11: %.4f",
+                averaged_metrics.macro_auc_12,
+                averaged_metrics.macro_auc_11,
+            )
+
+    results: dict[str, Any] | None = None
+    if is_rank0:
+        best_single = max(history, key=lambda h: h["score"]) if history else {"macro_auc_11": float("nan")}
+        delta = None
+        best_single_path = ckpt_dir / "dinov2_slothead_best_single.pth"
+
+        def _export_best_single() -> Path:
+            data = torch.load(top3_paths[0], map_location="cpu", weights_only=True)
+            torch.save(data["model_state_dict"], best_single_path)
+            return best_single_path
+
+        recommended = ensemble_path
+        if averaged_metrics is None:
+            logger.warning("Averaged ensemble unavailable; recommending best single.")
+            recommended = _export_best_single() if top3_paths else ensemble_path
+        elif not math.isnan(averaged_metrics.macro_auc_11) and not math.isnan(best_single["macro_auc_11"]):
+            delta = float(averaged_metrics.macro_auc_11) - best_single["macro_auc_11"]
+            if delta < -0.005:
+                logger.warning("Averaged top-3 is %.4f worse than best single; recommending best single.", -delta)
+                recommended = _export_best_single()
+
+        logger_instance.flush()
+        logger_instance.close()
+
+        results = {
+            "best_score": top_checkpoints[0][0] if top_checkpoints else 0.0,
+            "best_epoch": top_checkpoints[0][1] if top_checkpoints else 0,
+            "top3_checkpoints": [str(p) for p in top3_paths],
+            "averaged_weights_path": str(ensemble_path) if (averaging_ok[0] and ensemble_path.is_file()) else None,
+            "recommended_weights_path": str(recommended),
+            "averaged_vs_best_single_delta": delta,
+            "averaged_macro_auc_11": float(averaged_metrics.macro_auc_11) if averaged_metrics else None,
+            "averaged_macro_auc_12": float(averaged_metrics.macro_auc_12) if averaged_metrics else None,
+            "history": history,
+        }
+
+        # Persist results to disk so return value is not lost under mp.spawn / torchrun
+        results_json_path = ckpt_dir / "ddp_results.json"
+        results_json_path.write_text(json.dumps(results, indent=2))
+        logger.info("Saved DDP training results to %s", results_json_path)
+
+    # Barrier sync to ensure all ranks finish before tearing down distributed group
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    cleanup_ddp()
+    return results
+
+
+def _worker_wrapper(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    """Wrapper target for torch.multiprocessing.spawn."""
+    train_ddp_worker(rank=rank, local_rank=rank, world_size=world_size, args=args)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse DDP CLI arguments.
+
+    Returns:
+        argparse.Namespace containing parsed CLI options.
+    """
+    parser = argparse.ArgumentParser(description="RSNA Knee MRI Dual-T4 DDP Training Runner")
+    parser.add_argument("--fold", type=int, default=0, help="Validation fold ID (0, 1, 2)")
+    parser.add_argument("--epochs", type=int, default=12, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=4, help="Studies per batch per GPU")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--lr-backbone", type=float, default=3e-5, help="Backbone peak learning rate")
+    parser.add_argument("--lr-head", type=float, default=1e-3, help="SlotHead peak learning rate")
+    parser.add_argument("--weight-decay", type=float, default=0.02, help="AdamW weight decay")
+    parser.add_argument("--pct-start", type=float, default=0.15, help="OneCycleLR warmup fraction")
+    parser.add_argument("--gold-weight", type=float, default=5.0, help="Loss weight on gold studies")
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0, help="Gradient clipping max norm")
+    parser.add_argument("--img-size", type=int, default=336, help="Image slice resolution (default: 336)")
+    parser.add_argument("--weights-path", type=str, default=None, help="Offline DINOv2 backbone checkpoint path")
+    parser.add_argument("--allow-random-init", action="store_true", help="Permit random backbone init (tests only)")
+    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers per GPU")
+    parser.add_argument("--limit-train", type=int, default=None, help="Subset size for training dry runs")
+    parser.add_argument("--limit-val", type=int, default=None, help="Subset size for validation dry runs")
+    parser.add_argument("--seed", type=int, default=42, help="Base random seed")
+    parser.add_argument("--config-path", type=str, default=None, help="Path to config.yaml")
+    parser.add_argument("--labels-path", type=str, default=None, help="Path to soft labels")
+    parser.add_argument("--splits-path", type=str, default=None, help="Path to CV splits")
+    parser.add_argument("--dicom-root", type=str, default=None, help="DICOM directory root")
+    parser.add_argument("--series-csv", type=str, default=None, help="Path to train_series.csv")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Pre-extracted tensor cache directory")
+    parser.add_argument("--weights-dir", type=str, required=True, help="Checkpoint output directory")
+    parser.add_argument("--tb-dir", type=str, default=None, help="TensorBoard output directory")
+    parser.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision")
+    parser.add_argument("--nproc-per-node", type=int, default=None, help="Override GPU worker count")
+    parser.add_argument("--backend", type=str, default=None, help="Override distributed backend ('nccl' or 'gloo')")
+    args = parser.parse_args()
+    args.use_amp = not args.no_amp
+    return args
+
+
+def main() -> None:
+    """CLI entrypoint supporting both direct process spawn and torchrun launcher."""
+    args = parse_args()
+    if args.weights_path is None and not args.allow_random_init:
+        raise ValueError(
+            "weights_path (offline DINOv2 backbone checkpoint) is required. "
+            "Pass allow_random_init=True only for unit/smoke tests."
+        )
+
+    # Determine execution mode: torchrun launcher vs direct python spawn
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        train_ddp_worker(rank=rank, local_rank=local_rank, world_size=world_size, args=args)
+    else:
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if num_gpus < 2 and args.backend != "gloo":
+            raise RuntimeError(
+                f"Found {num_gpus} CUDA GPUs. Dual-T4 DDP requires at least 2 GPUs. "
+                "Specify --backend gloo explicitly if testing on CPU."
+            )
+        world_size = args.nproc_per_node or (num_gpus if num_gpus > 1 else 2)
+
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "localhost"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(_find_free_port())
+
+        print(f"[Launcher] Spawning {world_size} DDP worker processes on MASTER_PORT={os.environ['MASTER_PORT']}...")
+        torch.multiprocessing.spawn(
+            _worker_wrapper,
+            args=(world_size, args),
+            nprocs=world_size,
+            join=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
+
+# yagni: skipped custom fault-tolerant process supervisor and rendezvous servers; add when cluster preemption recovery is required.
