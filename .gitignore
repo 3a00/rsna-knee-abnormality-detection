@@ -34,6 +34,7 @@ outputs/weights/*.onnx
 outputs/checkpoint_dataset/
 outputs/weights/
 outputs/codebase_zip/
+outputs/kaggle_runs/
 .agents/
 
 public_notebooks_research
