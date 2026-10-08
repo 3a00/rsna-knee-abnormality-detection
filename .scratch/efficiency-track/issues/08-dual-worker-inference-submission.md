@@ -1,8 +1,8 @@
-# 07: Dual-Worker High-Speed Test Inference & Kaggle Submission
+# 08: Dual-Worker High-Speed Test Inference & Kaggle Submission
 
 **What to build:** A self-contained, offline-compatible Kaggle inference notebook and script (`notebooks/efficiency_submission.ipynb` and `scripts/infer_efficiency.py`) that loads pre-trained top-3 averaged DINOv2-Small SlotHead weights, distributes the ~1,300 Kaggle test studies 50/50 across `cuda:0` and `cuda:1` using multiprocessing workers, and writes the formatted `submission.csv` in $\le 15$ minutes without internet access or host memory crashes.
 
-**Blocked by:** 02: Fast 6-Slot DICOM Preprocessing Pipeline, 03: DINOv2-Small SlotHead Cross-Attention Architecture, 06: Dual-T4 DistributedDataParallel (DDP) Engine
+**Blocked by:** 02: Fast 6-Slot DICOM Preprocessing Pipeline, 03: DINOv2-Small SlotHead Cross-Attention Architecture, 06: Dual-T4 DistributedDataParallel (DDP) Engine, 07: Efficiency Track Training Stabilization, Anti-Overfitting & Caching Optimization
 
 **Status:** ready-for-agent
 

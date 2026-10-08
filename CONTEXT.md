@@ -78,6 +78,15 @@ _Avoid_: Filename sorting, raw InstanceNumber sorting.
 Cropping an anatomical region of fixed physical dimension (e.g. 140 mm) centered on the knee joint before resizing to decouple anatomical structure scale from scanner pixel spacing.
 _Avoid_: Direct uniform resizing, arbitrary pixel-count cropping.
 
+**Dynamic 2.5D Depth Jitter**:
+Randomly sampling a 3-consecutive-slice window ($[0:3]$, $[1:4]$, or $[2:5]$) from a pre-cached 5-slice physical stack ($[c-2 \dots c+2]$) during training to introduce volumetric variance without incurring DICOM decode I/O penalties.
+_Avoid_: Static single-triplet locking, online full-volume re-decoding.
+
+**Symmetry-Preserving MSK Augmentation**:
+Geometric and photometric transformations (mild rotation $\pm 7^\circ$, scale $0.93\text{--}1.07$, translation $\pm 4\%$, contrast $\pm 10\%$) applied uniformly across triplet slices while strictly prohibiting horizontal reflection to prevent swapping medial and lateral anatomical compartments.
+_Avoid_: Horizontal flipping, aggressive elastic distortion.
+
+
 
 ## Dataset & Label Semantics
 
@@ -112,4 +121,8 @@ _Avoid_: Micro-AUC, weighted AUC, softmax probability AUC.
 **Efficiency Track**:
 A Kaggle competition submission category evaluating model performance under strict runtime constraints (≤ 30 minutes total inference across ~1,300 test studies on Kaggle T4 GPUs).
 _Avoid_: Main track 9-hour runtime, multi-hour unconstrained ensemble.
+
+**Progressive Backbone Unfreezing**:
+A staged fine-tuning regimen transitioning from frozen feature extraction (head warmup), through top semantic transformer blocks, to full-depth differential learning rates to protect pretrained foundation representations from overfitting on small cohorts.
+_Avoid_: Instantaneous full-model unfreezing, static feature extraction.
 

@@ -160,5 +160,6 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
 - **ADR-0002**: [2.5D Stacking & Attention Pooling](file:///home/wenalz/Documents/Antigravity%20projects/RSNA_MRI/docs/adr/0002-2.5d-mil-with-attention-pooling.md)
 - **ADR-0003**: [Single-GPU vs Multi-GPU Execution](file:///home/wenalz/Documents/Antigravity%20projects/RSNA_MRI/docs/adr/0003-single-gpu-execution-over-dataparallel.md)
 - **ADR-0005**: [3-Fold Stratified GroupKFold Standardization](file:///home/wenalz/Documents/Antigravity%20projects/RSNA_MRI/docs/adr/0005-three-fold-stratified-groupkfold-standardization.md)
+- **ADR-0006**: [Five-Slice Pre-Caching & Progressive ViT Unfreezing](file:///home/wenalz/Documents/Antigravity%20projects/RSNA_MRI/docs/adr/0006-five-slice-caching-and-progressive-unfreezing.md)
 - **Competitor Teardown**: [`search/public_notebooks_research/01_FOUR_ARM_ARCHITECTURE_TEARDOWN.md`](file:///home/wenalz/Documents/Antigravity%20projects/RSNA_MRI/search/public_notebooks_research/01_FOUR_ARM_ARCHITECTURE_TEARDOWN.md)
 - **Speed Optimization Guide**: [`search/public_notebooks_research/05_EFFICIENCY_TRACK_AND_SPEED_OPTIMIZATION.md`](file:///home/wenalz/Documents/Antigravity%20projects/RSNA_MRI/search/public_notebooks_research/05_EFFICIENCY_TRACK_AND_SPEED_OPTIMIZATION.md)
