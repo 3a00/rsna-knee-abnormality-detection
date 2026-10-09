@@ -47,36 +47,31 @@ LABEL_COLS = [
 
 
 def test_differential_optimizer_parameter_groups():
-    """Verify differential optimizer splits parameters into 4 groups with correct LRs and decays."""
+    """Verify differential optimizer splits parameters into 10 groups with correct LRs and decays."""
     model = DINOv2SlotHead(pretrained=False, img_size=112)
     optimizer = build_differential_optimizer(
         model=model,
-        lr_backbone=3e-5,
+        lr_bottom=5e-6,
+        lr_mid=1e-5,
+        lr_top1=1.5e-5,
+        lr_top2=2e-5,
         lr_head=1e-3,
-        weight_decay=0.02,
+        weight_decay=0.05,
     )
 
-    assert len(optimizer.param_groups) == 4, f"Expected 4 groups, found {len(optimizer.param_groups)}"
+    assert len(optimizer.param_groups) == 10, f"Expected 10 groups, found {len(optimizer.param_groups)}"
 
-    # Group 0: Backbone decay
-    assert optimizer.param_groups[0]["lr"] == 3e-5
-    assert optimizer.param_groups[0]["weight_decay"] == 0.02
-    assert len(optimizer.param_groups[0]["params"]) > 0
-
-    # Group 1: Backbone no-decay
-    assert optimizer.param_groups[1]["lr"] == 3e-5
+    group_names = [g["name"] for g in optimizer.param_groups]
+    expected_names = [
+        "bb_bot_decay", "bb_bot_nodecay",
+        "bb_mid_decay", "bb_mid_nodecay",
+        "bb_top1_decay", "bb_top1_nodecay",
+        "bb_top2_decay", "bb_top2_nodecay",
+        "head_decay", "head_nodecay",
+    ]
+    assert group_names == expected_names
+    assert optimizer.param_groups[0]["weight_decay"] == 0.05
     assert optimizer.param_groups[1]["weight_decay"] == 0.0
-    assert len(optimizer.param_groups[1]["params"]) > 0
-
-    # Group 2: Head decay (cross_attn weights, cls_w)
-    assert optimizer.param_groups[2]["lr"] == 1e-3
-    assert optimizer.param_groups[2]["weight_decay"] == 0.02
-    assert len(optimizer.param_groups[2]["params"]) > 0
-
-    # Group 3: Head no-decay (biases, norms, slot_embed, finding_queries)
-    assert optimizer.param_groups[3]["lr"] == 1e-3
-    assert optimizer.param_groups[3]["weight_decay"] == 0.0
-    assert len(optimizer.param_groups[3]["params"]) > 0
 
     # Total parameters accounted for exactly
     total_opt_params = sum(len(g["params"]) for g in optimizer.param_groups)
@@ -167,7 +162,14 @@ def test_overfit_single_batch_loss_decreases():
     model = DINOv2SlotHead(pretrained=False, img_size=112, slot_dropout_p=0.0)
     pos_w = torch.tensor(load_pos_weights(), dtype=torch.float32)
     criterion = MaskedBCEWithLogitsLoss(gold_weight=5.0, pos_weight=pos_w, continuous_pos_weight=True)
-    opt = build_differential_optimizer(model, lr_backbone=1e-4, lr_head=1e-3)
+    opt = build_differential_optimizer(
+        model,
+        lr_bottom=1e-4,
+        lr_mid=1e-4,
+        lr_top1=1e-4,
+        lr_top2=1e-4,
+        lr_head=1e-3,
+    )
 
     x = torch.randn(4, NUM_SLOTS, 3, 112, 112)
     m = torch.ones(4, NUM_SLOTS)
