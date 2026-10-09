@@ -61,7 +61,11 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
   - Slot 3: `SAG_FLUID_NOFS` (Sagittal, Fluid-sensitive, Non-fat-suppressed)
   - Slot 4: `COR_T1` (Coronal, T1-weighted structural)
   - Slot 5: `SAG_T1` (Sagittal, T1-weighted structural)
-- **Slice Triplets (2.5D)**: For each slot, sample the central anatomical slice $c$ and its immediate neighbors $[c-1, c, c+1]$ stacked into 3 channels. If a sequence is absent, pass a zero-filled tensor and mark presence mask as 0.
+- **Slice Triplets & 5-Slice Caching (2.5D)**:
+  - **5-Slice Pre-Caching (`/kaggle/tmp/rsna_cache`)**: One-time preprocessing saves 5 consecutive slices per slot $[c-2, c-1, c, c+1, c+2]$ as FP16 tensors of shape `(6, 5, 336, 336)` with bitwise ImageNet RGB normalization.
+  - **Dynamic 2.5D Depth Jitter**: During training, DataLoader stochastically samples a 3-slice contiguous window from `{0:3, 1:4, 2:5}` per study, providing volumetric slice variance with zero runtime DICOM decoding overhead.
+  - **Evaluation & Inference**: Validation and test inference strictly use the deterministic central triplet `[1:4]` ($[c-1, c, c+1]$).
+  - If a sequence is absent, pass a zero-filled tensor and mark presence mask as 0.
 
 ### 4.2 Architecture: DINOv2-Small SlotHead (`src/models/dinov2_slothead.py`)
 - **Encoder**: `timm.create_model("vit_small_patch14_dinov2.lvd142m", pretrained=True, num_classes=0)` (embedding dim $D=384$, input size 336×336).
@@ -69,9 +73,9 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
   - Input: 6 slot image triplets $\to$ zero-gated for absent sequences $\to$ forward through DINOv2 $\to$ slot CLS tokens $S \in \mathbb{R}^{B \times 6 \times D}$.
   - Slot Identity Embeddings: $E_{\text{slot}} \in \mathbb{R}^{6 \times D}$ injected into $S$ so attention keys possess explicit sequence identity.
   - Learnable Queries: $Q \in \mathbb{R}^{12 \times D}$ representing the 12 clinical knee findings.
-  - Multi-Head Cross-Attention ($H=6$ heads): $Q$ attends to $(S + E_{\text{slot}})$ with `key_padding_mask` gating absent slots; all-absent studies unmasked to zero-tokens to prevent NaN softmax.
+  - Multi-Head Cross-Attention ($H=6$ heads, with `attn_dropout_p=0.2`): $Q$ attends to $(S + E_{\text{slot}})$ with `key_padding_mask` gating absent slots; all-absent studies unmasked to zero-tokens to prevent NaN softmax.
   - Residual & LayerNorm: $A = \text{LayerNorm}(Q + \text{Attn}(Q, S + E_{\text{slot}}))$.
-  - Per-Finding Classifier Head: $W_{\text{cls}} \in \mathbb{R}^{12 \times D}$ and $b_{\text{cls}} \in \mathbb{R}^{12}$, computing $\text{logits}_f = \langle A_f, W_f \rangle + b_f$, preventing logit collapse across findings.
+  - Regularized Classifier Head: Pre-classifier dropout $p=0.3$ followed by per-finding linear projection $W_{\text{cls}} \in \mathbb{R}^{12 \times D}$ and $b_{\text{cls}} \in \mathbb{R}^{12}$, computing $\text{logits}_f = \langle \text{Dropout}(A_f), W_f \rangle + b_f$, preventing logit collapse and head overfitting.
 - **Model Output**: Strictly raw logits of shape `(batch_size, 12)`. Sigmoid applied only during evaluation/inference.
 
 ### 4.3 Dual-T4 Distributed Execution (`src/training/` & `notebooks/`)
@@ -103,14 +107,25 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
 ### 4.5 Training Recipe & Optimization
 - **Loss**: `MaskedBCEWithLogitsLoss` supporting continuous soft targets, NaN masking for acute tear silence, and continuous positive class weighting ($w_f = 1.0 + (\text{pos\_weight}_f - 1.0) \cdot y_f$):
   `pos_weight = [2.70, 6.98, 1.21, 2.34, 2.12, 3.01, 1.83, 1.60, 2.94, 2.49, 2.21, 3.55]`
-- **Optimizer**: AdamW with layer-wise differential learning rates and weight decay exclusions:
-  - Backbone: `3e-5` (decay: `0.02` on 2D weights; `0.0` on 1D biases, norms, position tokens)
-  - SlotHead & Classifier: `1e-3` (decay: `0.02` on 2D weights; `0.0` on biases, LayerNorm, query/slot tokens)
-- **Scheduler**: `OneCycleLR` (12 epochs, `pct_start=0.15`, cosine annealing).
+- **Symmetry-Preserving MSK Augmentations (`apply_msk_augmentations`)**:
+  - Independent per-slot random affine: rotation $\pm 7^\circ$, translation $\pm 4\%$, scale $0.93\text{--}1.07$.
+  - Strictly no horizontal or vertical flips (preserves medial vs. lateral anatomical ground truth).
+  - Background fill using dynamic corner median.
+  - Photometric brightness/contrast jitter ($\pm 10\%$) and isotropic Gaussian blur ($\sigma \in [0.5, 1.0]$).
+- **Optimizer & LLRD**: AdamW with 8-group Layer-wise Learning Rate Decay (decay factor 0.85 across 4 depth tiers) and weight decay $0.05$ (excluding biases and norms):
+  - Head & queries: $\text{LR} = 1\times 10^{-3}$
+  - Backbone Tier 3 (Blocks 9–11): $\text{LR} = 2.0\times 10^{-5}$
+  - Backbone Tier 2 (Blocks 6–8): $\text{LR} = 1.2\times 10^{-5}$
+  - Backbone Tier 1 (Blocks 3–5): $\text{LR} = 7.4\times 10^{-6}$
+  - Backbone Tier 0 (Blocks 0–2): $\text{LR} = 4.5\times 10^{-6}$
+- **3-Stage Progressive Unfreezing Schedule (8 Epochs)**:
+  - *Stage 1 (Epochs 1–2)*: Freeze backbone; train SlotHead queries, attention, and classifier head at $\text{LR}=1\times 10^{-3}$.
+  - *Stage 2 (Epochs 3–4)*: Unfreeze top 4 ViT blocks (`blocks[8:]` + `norm`) at $\text{LR} \le 2\times 10^{-5}$.
+  - *Stage 3 (Epochs 5–8)*: Unfreeze entire backbone with LLRD schedule.
 - **Precision & Backend**:
   - `torch.backends.cudnn.benchmark = True`
   - `torch.autocast("cuda", dtype=torch.float16)` with automatic full-precision FP32 fallback for attention stability.
-- **Checkpoint Averaging**: Top-3 best validation epoch weights averaged post-training.
+- **Checkpoint Averaging**: Top-3 best validation epoch checkpoints selected strictly from Stage 3 (Epochs 5–8) and averaged (`dinov2_slothead_top3.pth`).
 
 ---
 
@@ -123,16 +138,24 @@ A self-contained, lightning-fast Efficiency Track pipeline featuring:
    - Verify input shape `(B, 6, 3, 336, 336)` returns output logits of shape `(B, 12)`.
    - Verify presence mask zero-gating functions correctly when slots are missing.
    - Assert attention weights sum to 1.0 across the 6 slots for each finding.
+   - Verify attention dropout ($p=0.2$) and pre-classifier dropout ($p=0.3$) integration.
 3. **TensorBoard Integration Tests (`tests/test_tensorboard_logging.py`)**:
    - Smoke test `TensorBoardLogger` to verify scalar, figure, and graph events write cleanly without throwing serialization errors.
 4. **Dual-GPU DDP Smoke Test (`scripts/smoke_ddp.py`)**:
-   - Verify 2-worker DDP initializes, executes 2 training steps, and synchronizes weights without hanging or host memory growth.
+   - Verify 2-worker DDP initializes, executes training steps across 3 unfreezing stages, and synchronizes weights without hanging or host memory growth.
+5. **Caching & Regularization Tests (`tests/test_caching_and_regularization.py`)**:
+   - Verify 5-slice caching shape `(6, 5, 336, 336)` and edge clipping for $n < 5$.
+   - Verify dynamic 2.5D depth jitter distribution and deterministic eval window `[1:4]`.
+   - Verify MSK augmentations enforce zero flips, valid affine translation/rotation bounds, and dynamic corner median fill.
+   - Verify LLRD 8 parameter groups and decay monotonicity.
+   - Verify 3-stage progressive unfreezing transition logic and Stage-3 Top-3 checkpoint averaging.
 
 ---
 
 ## 6. Out of Scope
 
 - **Main Track 39-Model Ensemble**: Defer all multi-arm blending (CoAtNet + RadImageNet + DINOv3) to Main Track development.
+- **Multi-Anchor Caching**: Stays a 1-fold ablation after Issue 07 lands (single-center 5-slice pre-caching with dynamic depth jitter is the active production baseline; multi-anchor caching evaluating anatomical offsets like anterior/posterior or medial/lateral anchors is deferred to a future ablation).
 - **Dense Sliding Window Overlap (94 Windows)**: Dropped due to 9-hour inference requirement.
 - **Random Cross-Validation Splits**: Strictly prohibited due to scanner signature leakage (+0.053 artificial AUC).
 - **Hard Label Binarization**: Rejected; continuous calibrated soft labels are required to prevent loss penalties on hedged radiologist sentences.

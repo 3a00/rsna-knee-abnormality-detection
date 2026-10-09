@@ -108,6 +108,7 @@ notebook = {
                 "# Assert core modules are ready\n",
                 "required_files = [\n",
                 "    'scripts/train_ddp_efficiency.py',\n",
+                "    'scripts/preprocess_volumes.py',\n",
                 "    'src/models/dinov2_slothead.py',\n",
                 "    'src/datasets/efficiency_pipeline.py',\n",
                 "    'src/training/train_efficiency.py',\n",
@@ -157,12 +158,14 @@ notebook = {
                 "    print(f'Backbone weights already present at: {BACKBONE_PATH}')\n"
             ]
         },
+        # Cell 4: One-Time Pre-Caching
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "## Cell 4: Smoke Test (Optional Dual-GPU Verification)\n",
-                "Executes a quick 3-epoch synthetic smoke test across both GPUs to confirm NCCL process group communication, balanced VRAM, and zero host RAM leaks before running full training."
+                "## Cell 4: One-Time 5-Slice Volume Pre-Caching (~18–24 min)\n",
+                "Pre-extracts 5 centered physical slices per present slot into session scratch (`/kaggle/tmp/rsna_cache`).\n",
+                "Completely eliminates network-disk I/O bottlenecks during distributed training."
             ]
         },
         {
@@ -171,20 +174,24 @@ notebook = {
             "metadata": {},
             "outputs": [],
             "source": [
-                "# Optional sanity check: run synthetic smoke test across both GPUs\n",
-                "!python scripts/smoke_ddp.py --img-size 336\n"
+                "# Confirm scratch directory exists and is writable\n",
+                "!mkdir -p /kaggle/tmp/rsna_cache\n",
+                "\n",
+                "!python scripts/preprocess_volumes.py \\\n",
+                "    --dicom-root /kaggle/input/rsna-knee-abnormality-detection \\\n",
+                "    --cache-dir /kaggle/tmp/rsna_cache \\\n",
+                "    --series-csv /kaggle/input/rsna-knee-abnormality-detection/train_series.csv \\\n",
+                "    --splits-csv /kaggle/working/data/splits/cv_folds_3fold.csv \\\n",
+                "    --num-workers 4\n"
             ]
         },
+        # Cell 5: Dual-T4 DistributedDataParallel Full Training (8 Epochs, ~18 min)
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "## Cell 5: Dual-T4 DistributedDataParallel Full Training\n",
-                "Launches the full distributed training runner (`scripts/train_ddp_efficiency.py`) across both T4 GPUs.\n",
-                "- **Fold:** 0 (of the 3-fold scanner-fingerprint StratifiedGroupKFold split)\n",
-                "- **Resolution:** 336x336 px\n",
-                "- **Batch size:** 4 studies per GPU (effective batch size 8)\n",
-                "- **Checkpoints:** Saves Top-3 validation checkpoints and performs arithmetic parameter averaging to produce `dinov2_slothead_top3.pth`."
+                "## Cell 5: Dual-T4 DistributedDataParallel Full Training (8 Epochs, ~18 min)\n",
+                "Trains DINOv2-Small SlotHead with dynamic depth jitter, symmetry-preserving augmentations, and 3-stage progressive unfreezing."
             ]
         },
         {
@@ -195,14 +202,14 @@ notebook = {
             "source": [
                 "!python scripts/train_ddp_efficiency.py \\\n",
                 "    --fold 0 \\\n",
-                "    --epochs 12 \\\n",
+                "    --epochs 8 \\\n",
                 "    --batch-size 4 \\\n",
                 "    --grad-accum-steps 1 \\\n",
                 "    --img-size 336 \\\n",
-                "    --lr-backbone 3e-5 \\\n",
-                "    --lr-head 1e-3 \\\n",
-                "    --weight-decay 0.02 \\\n",
+                "    --weight-decay 0.05 \\\n",
                 "    --gold-weight 5.0 \\\n",
+                "    --cache-dir /kaggle/tmp/rsna_cache \\\n",
+                "    --require-cache \\\n",
                 "    --weights-path {str(BACKBONE_PATH)} \\\n",
                 "    --weights-dir /kaggle/working/outputs/weights \\\n",
                 "    --tb-dir /kaggle/working/outputs/tensorboard \\\n",

@@ -44,6 +44,8 @@ class DINOv2SlotHead(nn.Module):
         pretrained: bool = False,
         weights_path: str | None = None,
         slot_dropout_p: float = 0.0,
+        attn_dropout_p: float = 0.2,
+        pre_cls_dropout_p: float = 0.3,
         init_bias_priors: list[float] | torch.Tensor | None = None,
     ) -> None:
         """Initializes the DINOv2SlotHead model.
@@ -57,6 +59,8 @@ class DINOv2SlotHead(nn.Module):
             pretrained: Whether to download pretrained weights via timm (default: False for offline compliance).
             weights_path: Path to offline .pth checkpoint for weight loading and pos_embed resampling.
             slot_dropout_p: Probability of dropping present slots during training (default: 0.0).
+            attn_dropout_p: Cross-attention dropout probability (default: 0.2).
+            pre_cls_dropout_p: Pre-classifier dropout probability (default: 0.3).
             init_bias_priors: Empirical positive label priors for zero-step BCE log-odds bias initialization.
         """
         super().__init__()
@@ -66,6 +70,8 @@ class DINOv2SlotHead(nn.Module):
         self.num_heads = num_heads
         self.img_size = img_size
         self.slot_dropout_p = slot_dropout_p
+        self.attn_dropout_p = attn_dropout_p
+        self.pre_cls_dropout_p = pre_cls_dropout_p
 
         # Backbone: DINOv2-Small patch14 (consistent .lvd142m tag)
         if weights_path is not None:
@@ -97,11 +103,15 @@ class DINOv2SlotHead(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
+            dropout=attn_dropout_p,
             batch_first=True,
         )
 
         # Residual LayerNorm
         self.norm = nn.LayerNorm(embed_dim)
+
+        # Pre-classifier dropout regularization
+        self.pre_cls_dropout = nn.Dropout(p=pre_cls_dropout_p)
 
         # Per-finding linear classification head (12, D)
         self.cls_w = nn.Parameter(torch.randn(num_findings, embed_dim) * 0.02)
@@ -173,6 +183,7 @@ class DINOv2SlotHead(nn.Module):
             )
 
             attended = self.norm(queries + attended)
+            attended = self.pre_cls_dropout(attended)
             logits = (attended * self.cls_w).sum(dim=-1) + self.cls_b
 
         clean_weights = None

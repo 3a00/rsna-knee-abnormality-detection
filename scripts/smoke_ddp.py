@@ -37,12 +37,14 @@ except ImportError:
     if user_site.is_dir() and str(user_site) not in sys.path:
         sys.path.append(str(user_site))
 
+import json
 import pandas as pd
 import psutil
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import weakref
 
 from src.datasets.efficiency_pipeline import NUM_SLOTS
 from src.models.dinov2_slothead import DINOv2SlotHead
@@ -53,6 +55,7 @@ from src.training.train_efficiency import (
     collate_efficiency,
     seed_everything,
 )
+from scripts.train_ddp_efficiency import apply_unfreezing_stage, rewrap_ddp
 
 LABEL_COLS = [
     "ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Lateral OA",
@@ -97,9 +100,25 @@ def make_synthetic_cache(
 
     uids = [f"smoke_study_{i:03d}" for i in range(n_studies)]
     for uid in uids:
-        tensor = torch.randn(NUM_SLOTS, 3, img_size, img_size, dtype=torch.float16)
+        tensor = torch.randn(NUM_SLOTS, 5, img_size, img_size, dtype=torch.float16)
         presence = torch.tensor([1.0] * n_present + [0.0] * (NUM_SLOTS - n_present), dtype=torch.float32)
-        torch.save({"image": tensor, "presence_mask": presence, "meta": {"size": img_size}}, cache_dir / f"{uid}.pt")
+        torch.save({
+            "image": tensor,
+            "presence_mask": presence,
+            "meta": {"target_size": img_size, "crop_mm": 140.0, "n_slices_cached": 5},
+        }, cache_dir / f"{uid}.pt")
+
+    manifest = {
+        "target_size": img_size,
+        "crop_mm": 140.0,
+        "n_slices_cached": 5,
+        "total_studies_expected": n_studies,
+        "total_cached_files": n_studies,
+        "failed_uids": [],
+        "empty_uids": [],
+        "in_progress": False,
+    }
+    (cache_dir / "cache_manifest.json").write_text(json.dumps(manifest))
 
     splits_csv = root_dir / "splits.csv"
     fold_ids = [0 if i < n_val else 1 for i in range(n_studies)]
@@ -162,23 +181,27 @@ def _smoke_worker(
         target_size=img_size,
         cached_tensor_dir=cache_dir,
         num_workers=0,
+        is_train=True,
     )
 
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=42)
     loader = DataLoader(dataset, batch_size=4, sampler=sampler, collate_fn=collate_efficiency)
 
-    model = DINOv2SlotHead(pretrained=False, img_size=img_size).to(device)
-    if is_cuda:
-        ddp_model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[rank],
-            output_device=rank,
-            find_unused_parameters=False,
-        )
-    else:
-        ddp_model = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=False)
+    model = DINOv2SlotHead(
+        pretrained=False,
+        img_size=img_size,
+        attn_dropout_p=0.2,
+        pre_cls_dropout_p=0.3,
+    ).to(device)
 
-    optimizer = build_differential_optimizer(ddp_model.module, lr_backbone=3e-5, lr_head=1e-3, weight_decay=0.02)
+    optimizer = build_differential_optimizer(
+        model,
+        lr_bottom=5e-6,
+        lr_mid=1e-5,
+        lr_top=2e-5,
+        lr_head=1e-3,
+        weight_decay=0.05,
+    )
     criterion = MaskedBCEWithLogitsLoss()
     scaler = torch.amp.GradScaler("cuda", init_scale=1024.0, enabled=is_cuda)
 
@@ -186,10 +209,25 @@ def _smoke_worker(
     step_times: list[float] = []
     step_i = 0
     WARMUP_STEPS = 2
+    ddp_model = None
 
-    for epoch in range(1, 4):
+    for epoch in range(1, 5):
+        stage = 1 if epoch == 1 else (2 if epoch == 2 else 3)
+        apply_unfreezing_stage(model, stage)
+
+        ref = weakref.ref(ddp_model) if ddp_model is not None else None
+        ddp_model = None
+        gc.collect()
+        if is_cuda:
+            torch.cuda.empty_cache()
+        assert ref is None or ref() is None, "Stale DDP wrapper deallocation leak!"
+        if dist.is_initialized():
+            dist.barrier()
+
+        ddp_model = rewrap_ddp(model, device, rank)
         sampler.set_epoch(epoch)
         ddp_model.train()
+
         for batch in loader:
             t0 = time.perf_counter()
             images = batch["image"].to(device).float()
@@ -220,7 +258,7 @@ def _smoke_worker(
     gpu_vram = torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0) if is_cuda else 0.0
 
     # Bitwise parameter equality check across workers (handles world_size=1 without IndexError)
-    flat_params = torch.cat([p.detach().flatten() for p in ddp_model.module.parameters()])
+    flat_params = torch.cat([p.detach().flatten() for p in model.parameters()])
     all_flat = [torch.zeros_like(flat_params) for _ in range(world_size)]
     dist.all_gather(all_flat, flat_params)
     weights_match = all(torch.equal(all_flat[0], t) for t in all_flat[1:])
@@ -228,7 +266,7 @@ def _smoke_worker(
     # Save checkpoint on rank 0 (strictly bare state dict)
     if rank == 0:
         ckpt_path = weights_dir / "smoke_checkpoint.pth"
-        torch.save(ddp_model.module.state_dict(), ckpt_path)
+        torch.save(model.state_dict(), ckpt_path)
 
     dist.barrier()
     dist.destroy_process_group()
@@ -298,10 +336,10 @@ def run_smoke_ddp(img_size: int | None = None) -> bool:
         # 3. Assert exact parameter synchronization
         assert r0["weights_match"] and r1["weights_match"], "Model weights diverged across DDP workers"
 
-        # 4. Host RAM leak check: RSS delta between epoch 3 and epoch 2 < 100MB (steady-state)
-        rss_leak_0 = r0["epoch_rss"][2] - r0["epoch_rss"][1]
-        rss_leak_1 = r1["epoch_rss"][2] - r1["epoch_rss"][1]
-        print(f"Host RSS Growth (Ep3 - Ep2): Rank 0 = {rss_leak_0:.2f} MB, Rank 1 = {rss_leak_1:.2f} MB")
+        # 4. Host RAM leak check: RSS delta between epoch 4 and epoch 3 < 100MB (steady-state in Stage 3)
+        rss_leak_0 = r0["epoch_rss"][3] - r0["epoch_rss"][2]
+        rss_leak_1 = r1["epoch_rss"][3] - r1["epoch_rss"][2]
+        print(f"Host RSS Growth (Ep4 - Ep3): Rank 0 = {rss_leak_0:.2f} MB, Rank 1 = {rss_leak_1:.2f} MB")
         assert rss_leak_0 < 100.0 and rss_leak_1 < 100.0, "Host memory leak detected between steady-state epochs"
 
         # 5. Throughput scaling check (weak scaling: 2 * per_rank_tp / baseline_tp)
