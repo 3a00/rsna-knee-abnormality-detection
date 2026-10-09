@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from datetime import timedelta
 import gc
+import math
 import os
 from pathlib import Path
 import socket
@@ -55,7 +56,12 @@ from src.training.train_efficiency import (
     collate_efficiency,
     seed_everything,
 )
-from scripts.train_ddp_efficiency import apply_unfreezing_stage, rewrap_ddp
+from scripts.train_ddp_efficiency import (
+    apply_unfreezing_stage,
+    evaluate_dataset_collective,
+    lr_for,
+    rewrap_ddp,
+)
 
 LABEL_COLS = [
     "ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Lateral OA",
@@ -129,7 +135,10 @@ def make_synthetic_cache(
     }).to_csv(splits_csv, index=False)
 
     labels_parquet = root_dir / "labels_soft.parquet"
-    ldict: dict[str, Any] = {"StudyInstanceUID": uids}
+    ldict: dict[str, Any] = {
+        "StudyInstanceUID": uids,
+        "is_gold": [1 if i < 2 else 0 for i in range(n_studies)],
+    }
     for col in LABEL_COLS:
         ldict[col] = [float(i % 2 == 0) for i in range(n_studies)]
     ldict["synovitis_soft"] = [0.22] * n_studies
@@ -168,24 +177,42 @@ def _smoke_worker(
 
     splits_df = pd.read_csv(splits_csv)
     labels_df = pd.read_parquet(labels_parquet)
-    uids = splits_df["StudyInstanceUID"].tolist()
-    labels_arr = labels_df[LABEL_COLS].values
-    is_gold_arr = splits_df["is_gold"].values
-    mock_dirs = [cache_dir / u for u in uids]
+    if "is_gold" in labels_df.columns and "is_gold" in splits_df.columns:
+        labels_df = labels_df.drop(columns=["is_gold"])
+    merged = splits_df.merge(labels_df, on="StudyInstanceUID")
+    if "is_gold" not in merged.columns and "is_gold_x" in merged.columns:
+        merged["is_gold"] = merged["is_gold_x"]
+    train_df = merged[merged["fold_id"] != 0].reset_index(drop=True)
+    val_df = merged[merged["fold_id"] == 0].reset_index(drop=True)
 
-    dataset = EfficiencyStudyDataset(
-        study_uids=uids,
-        study_dirs=mock_dirs,
-        labels=labels_arr,
-        is_gold=is_gold_arr,
+    train_uids = train_df["StudyInstanceUID"].tolist()
+    train_dataset = EfficiencyStudyDataset(
+        study_uids=train_uids,
+        study_dirs=[cache_dir / u for u in train_uids],
+        labels=train_df[LABEL_COLS].values,
+        is_gold=train_df["is_gold"].values,
         target_size=img_size,
         cached_tensor_dir=cache_dir,
         num_workers=0,
         is_train=True,
     )
+    val_uids = val_df["StudyInstanceUID"].tolist()
+    val_dataset = EfficiencyStudyDataset(
+        study_uids=val_uids,
+        study_dirs=[cache_dir / u for u in val_uids],
+        labels=val_df[LABEL_COLS].values,
+        is_gold=val_df["is_gold"].values,
+        target_size=img_size,
+        cached_tensor_dir=cache_dir,
+        num_workers=0,
+        is_train=False,
+    )
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=42)
-    loader = DataLoader(dataset, batch_size=4, sampler=sampler, collate_fn=collate_efficiency)
+    sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=42)
+    loader = DataLoader(train_dataset, batch_size=4, sampler=sampler, collate_fn=collate_efficiency)
+
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=4, sampler=val_sampler, collate_fn=collate_efficiency)
 
     model = DINOv2SlotHead(
         pretrained=False,
@@ -195,10 +222,11 @@ def _smoke_worker(
     ).to(device)
 
     optimizer = build_differential_optimizer(
-        model,
+        model=model,
         lr_bottom=5e-6,
         lr_mid=1e-5,
-        lr_top=2e-5,
+        lr_top1=1.5e-5,
+        lr_top2=2e-5,
         lr_head=1e-3,
         weight_decay=0.05,
     )
@@ -207,12 +235,15 @@ def _smoke_worker(
 
     epoch_rss: list[float] = []
     step_times: list[float] = []
+    epoch_durations: list[float] = []
     step_i = 0
     WARMUP_STEPS = 2
+    global_step_smoke = 0
     ddp_model = None
 
-    for epoch in range(1, 5):
-        stage = 1 if epoch == 1 else (2 if epoch == 2 else 3)
+    for epoch in range(1, 6):
+        t_start = time.perf_counter()
+        stage = min(4, epoch)
         apply_unfreezing_stage(model, stage)
 
         ref = weakref.ref(ddp_model) if ddp_model is not None else None
@@ -227,6 +258,8 @@ def _smoke_worker(
         ddp_model = rewrap_ddp(model, device, rank)
         sampler.set_epoch(epoch)
         ddp_model.train()
+        if stage == 1:
+            model.backbone.eval()
 
         for batch in loader:
             t0 = time.perf_counter()
@@ -235,14 +268,21 @@ def _smoke_worker(
             targets = batch["labels"].to(device)
             is_gold = batch["is_gold"].to(device)
 
+            # Apply explicit lr_for to exercise schedule and ramps on real hardware
+            for g in optimizer.param_groups:
+                family = g["name"].rsplit("_", 1)[0]
+                g["lr"] = lr_for(family, step=global_step_smoke, spe=len(loader), epochs=4)
+
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, dtype=torch.float16, enabled=is_cuda):
                 logits = ddp_model(images, masks)
                 loss = criterion(logits.float(), targets, is_gold)
 
+            assert torch.isfinite(loss), f"Training loss non-finite: {loss.item()}"
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            global_step_smoke += 1
 
             if is_cuda:
                 torch.cuda.synchronize(device)
@@ -252,7 +292,33 @@ def _smoke_worker(
                 step_times.append(dt)
             step_i += 1
 
+        logits = loss = None
         epoch_rss.append(get_process_rss_mb())
+
+        dur = time.perf_counter() - t_start
+        epoch_durations.append(dur)
+        s_per_step = dur / max(1, len(loader))
+        if rank == 0:
+            print(f"Smoke Epoch {epoch} (Stage {stage}) completed in {dur:.2f}s ({s_per_step:.3f} s/step)")
+
+    # Post-training GPU collective validation check
+    score_11, score_12, val_loss, _ = evaluate_dataset_collective(
+        ddp_model=ddp_model,
+        val_loader=val_loader,
+        device=device,
+        world_size=world_size,
+        label_cols=LABEL_COLS,
+        is_rank0=(rank == 0),
+        use_amp=is_cuda,
+        criterion=criterion,
+    )
+    if rank == 0:
+        assert math.isfinite(val_loss), f"Collective validation loss non-finite: {val_loss}"
+        print(f"Smoke Collective Validation passed: Score11={score_11}, ValLoss={val_loss:.4f}")
+
+        avg_step_s = sum(epoch_durations) / (len(epoch_durations) * len(loader))
+        est_full_epoch_s = avg_step_s * 367
+        print(f"Realistic Extrapolated 10-Epoch Duration: {(est_full_epoch_s * 10) / 60:.1f} minutes")
 
     per_rank_tp = 4.0 / max(1e-5, statistics.median(step_times)) if step_times else 0.0
     gpu_vram = torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0) if is_cuda else 0.0
@@ -336,10 +402,10 @@ def run_smoke_ddp(img_size: int | None = None) -> bool:
         # 3. Assert exact parameter synchronization
         assert r0["weights_match"] and r1["weights_match"], "Model weights diverged across DDP workers"
 
-        # 4. Host RAM leak check: RSS delta between epoch 4 and epoch 3 < 100MB (steady-state in Stage 3)
-        rss_leak_0 = r0["epoch_rss"][3] - r0["epoch_rss"][2]
-        rss_leak_1 = r1["epoch_rss"][3] - r1["epoch_rss"][2]
-        print(f"Host RSS Growth (Ep4 - Ep3): Rank 0 = {rss_leak_0:.2f} MB, Rank 1 = {rss_leak_1:.2f} MB")
+        # 4. Host RAM leak check: RSS delta between epoch 5 and epoch 4 < 100MB (steady-state in Stage 4)
+        rss_leak_0 = r0["epoch_rss"][4] - r0["epoch_rss"][3]
+        rss_leak_1 = r1["epoch_rss"][4] - r1["epoch_rss"][3]
+        print(f"Host RSS Growth (Ep5 - Ep4): Rank 0 = {rss_leak_0:.2f} MB, Rank 1 = {rss_leak_1:.2f} MB")
         assert rss_leak_0 < 100.0 and rss_leak_1 < 100.0, "Host memory leak detected between steady-state epochs"
 
         # 5. Throughput scaling check (weak scaling: 2 * per_rank_tp / baseline_tp)

@@ -20,6 +20,7 @@ import tempfile
 import weakref
 
 import numpy as np
+import pandas as pd
 import pydicom
 from pydicom.dataset import Dataset as DcmDataset, FileMetaDataset
 import pytest
@@ -34,10 +35,16 @@ from src.datasets.efficiency_pipeline import (
     process_study_to_5slice_cache,
 )
 from src.models.dinov2_slothead import DINOv2SlotHead
+from src.training.losses import MaskedBCEWithLogitsLoss
 from src.training.train_efficiency import (
+    STAGE4_LR_PEAKS,
     EfficiencyStudyDataset,
     apply_msk_augmentations,
     build_differential_optimizer,
+    compute_collective_val_loss,
+    impute_soft_synovitis,
+    stage_for_epoch,
+    stage4_start_for,
 )
 from scripts.train_ddp_efficiency import (
     apply_unfreezing_stage,
@@ -176,67 +183,237 @@ def test_aug_no_flip_and_absent_slots_untouched() -> None:
         assert a[3].abs().max() == 0.0 and a[4].abs().max() == 0.0
 
 
-def test_model_regularization_and_llrd_routing() -> None:
-    """Verify SlotHead dropout rates and correct bottom routing for patch_embed / pos_embed."""
-    model = DINOv2SlotHead(
-        embed_dim=384,
-        num_slots=6,
-        num_findings=12,
-        pretrained=False,
-        attn_dropout_p=0.2,
-        pre_cls_dropout_p=0.3,
-    )
-    assert model.cross_attn.dropout == 0.2
-    assert isinstance(model.pre_cls_dropout, nn.Dropout)
-    assert model.pre_cls_dropout.p == 0.3
+def test_stage_for_epoch_and_lr_alignment() -> None:
+    """Verify single source of truth for unfreezing stage boundaries and peaks."""
+    assert [stage_for_epoch(e) for e in range(1, 11)] == [1, 1, 2, 2, 3, 3, 4, 4, 4, 4]
+    assert set(STAGE4_LR_PEAKS.keys()) == {"bb_bot", "bb_mid", "bb_top1", "bb_top2", "head"}
 
-    opt = build_differential_optimizer(model, lr_bottom=5e-6, lr_mid=1e-5, lr_top=2e-5, lr_head=1e-3, weight_decay=0.05)
-    assert len(opt.param_groups) == 8
+
+def test_stage_coupling_lr_and_unfreezing() -> None:
+    """Verify that in every stage, families with lr_for > 0 match requires_grad parameters exactly."""
+    model = DINOv2SlotHead(pretrained=False)
+    spe = 100
+    epochs = 10
+
+    expected_active_families = {
+        1: {"head"},
+        2: {"head", "bb_top2"},
+        3: {"head", "bb_top2", "bb_top1"},
+        4: {"head", "bb_top2", "bb_top1", "bb_mid", "bb_bot"},
+    }
+
+    for stage in (1, 2, 3, 4):
+        apply_unfreezing_stage(model, stage)
+        step = (2 * stage - 1) * spe  # Middle of stage
+
+        active_lr_families = {
+            fam for fam in ("head", "bb_top2", "bb_top1", "bb_mid", "bb_bot")
+            if lr_for(fam, step, spe, epochs) > 0.0
+        }
+        assert active_lr_families == expected_active_families[stage]
+
+
+def test_apply_unfreezing_stages_four_stage_progression() -> None:
+    """Verify parameter requires_grad transitions across all 4 stages."""
+    model = DINOv2SlotHead(pretrained=False)
+
+    # Stage 1: Entire backbone frozen
+    apply_unfreezing_stage(model, 1)
+    assert not any(p.requires_grad for p in model.backbone.parameters())
+    assert model.finding_queries.requires_grad
+    assert model.slot_embed.requires_grad
+    head_params = [p for n, p in model.named_parameters() if not n.startswith("backbone.")]
+    assert all(p.requires_grad for p in head_params)
+
+    # Stage 2: Top-2 blocks (10, 11) + norm unfrozen
+    apply_unfreezing_stage(model, 2)
+    assert all(p.requires_grad for p in model.backbone.blocks[10].parameters())
+    assert all(p.requires_grad for p in model.backbone.blocks[11].parameters())
+    assert all(p.requires_grad for p in model.backbone.norm.parameters())
+    assert not any(p.requires_grad for p in model.backbone.blocks[9].parameters())
+    assert not any(p.requires_grad for p in model.backbone.patch_embed.parameters())
+
+    # Stage 3: Top-4 blocks (8, 9, 10, 11) + norm unfrozen
+    apply_unfreezing_stage(model, 3)
+    assert all(p.requires_grad for p in model.backbone.blocks[8].parameters())
+    assert all(p.requires_grad for p in model.backbone.blocks[9].parameters())
+    assert all(p.requires_grad for p in model.backbone.blocks[10].parameters())
+    assert all(p.requires_grad for p in model.backbone.blocks[11].parameters())
+    assert all(p.requires_grad for p in model.backbone.norm.parameters())
+    assert not any(p.requires_grad for p in model.backbone.blocks[7].parameters())
+
+    # Stage 4: Entire backbone unfrozen
+    apply_unfreezing_stage(model, 4)
+    assert all(p.requires_grad for p in model.backbone.parameters())
+
+
+def test_optimizer_ten_param_groups_llrd_routing() -> None:
+    """Verify build_differential_optimizer creates 10 groups without dead shims."""
+    model = DINOv2SlotHead(pretrained=False)
+    opt = build_differential_optimizer(
+        model,
+        lr_bottom=5e-6,
+        lr_mid=1e-5,
+        lr_top1=1.5e-5,
+        lr_top2=2e-5,
+        lr_head=1e-3,
+        weight_decay=0.05,
+    )
+    assert len(opt.param_groups) == 10
+
+    group_names = [g["name"] for g in opt.param_groups]
+    expected_names = [
+        "bb_bot_decay", "bb_bot_nodecay",
+        "bb_mid_decay", "bb_mid_nodecay",
+        "bb_top1_decay", "bb_top1_nodecay",
+        "bb_top2_decay", "bb_top2_nodecay",
+        "head_decay", "head_nodecay",
+    ]
+    assert group_names == expected_names
 
     bot_params = set(opt.param_groups[0]["params"]) | set(opt.param_groups[1]["params"])
     assert model.backbone.patch_embed.proj.weight in bot_params
-    assert model.backbone.pos_embed in bot_params
 
-    top_params = set(opt.param_groups[4]["params"]) | set(opt.param_groups[5]["params"])
-    assert model.backbone.norm.weight in top_params
+    mid_params = set(opt.param_groups[2]["params"]) | set(opt.param_groups[3]["params"])
+    assert model.backbone.blocks[5].attn.qkv.weight in mid_params
+
+    top1_params = set(opt.param_groups[4]["params"]) | set(opt.param_groups[5]["params"])
+    assert model.backbone.blocks[8].attn.qkv.weight in top1_params
+    assert model.backbone.blocks[9].attn.qkv.weight in top1_params
+
+    top2_params = set(opt.param_groups[6]["params"]) | set(opt.param_groups[7]["params"])
+    assert model.backbone.blocks[10].attn.qkv.weight in top2_params
+    assert model.backbone.norm.weight in top2_params
 
 
-def test_lr_for_stage_boundaries() -> None:
-    """Verify explicit lr_for matches stated schedule at stage boundaries."""
+def test_lr_for_schedule_ramps_and_continuity() -> None:
+    """Verify explicit lr_for matches stated schedule and avoids downward spikes for warm layers."""
     spe = 100
-    epochs = 8
+    epochs = 10
 
-    # Step 0 (Start of Stage 1): Head warms up from 1e-4, backbone is 0
+    # Stage 1: Head warmup & decay
     assert lr_for("head", 0, spe, epochs) == pytest.approx(1e-4)
-    assert lr_for("bb_top", 0, spe, epochs) == 0.0
-
-    # Step = 100 (Epoch 1): Head peaks at 1e-3
+    assert lr_for("bb_top2", 0, spe, epochs) == 0.0
     assert lr_for("head", 100, spe, epochs) == pytest.approx(1e-3)
-    assert lr_for("bb_top", 100, spe, epochs) == 0.0
 
-    # Step = 200 (Epoch 2, Start of Stage 2): Head = 5e-4, bb_top = 1e-5, bb_mid = 0
+    # Stage 2 start (step 200): bb_top2 warms up with 100-step ramp
     assert lr_for("head", 200, spe, epochs) == pytest.approx(5e-4)
-    assert lr_for("bb_top", 200, spe, epochs) == pytest.approx(1e-5)
-    assert lr_for("bb_mid", 200, spe, epochs) == 0.0
+    assert lr_for("bb_top2", 200, spe, epochs) == pytest.approx(1e-5 * 0.05)
+    assert lr_for("bb_top2", 300, spe, epochs) == pytest.approx(1e-5)
+    assert lr_for("bb_top1", 250, spe, epochs) == 0.0
 
-    # Step = 400 (Epoch 4, Start of Stage 3): 5% floor ramp on backbone only, head unaffected
+    # Stage 3 start (step 400): bb_top2 steps up cleanly; bb_top1 starts ramp
     assert lr_for("head", 400, spe, epochs) == pytest.approx(2e-4)
-    assert lr_for("bb_top", 400, spe, epochs) == pytest.approx(2e-5 * 0.05)
+    assert lr_for("bb_top2", 400, spe, epochs) == pytest.approx(1.5e-5)
+    assert lr_for("bb_top1", 400, spe, epochs) == pytest.approx(1e-5 * 0.05)
+    assert lr_for("bb_mid", 450, spe, epochs) == 0.0
 
-    # Step = 450 (Epoch 4.5, mid ramp in Stage 3):
-    # ep3 = 0.5 -> p = 0.5 / 4.0 = 0.125 -> cos(pi * 0.125) = cos(pi / 8) -> ramp = 50 / 100 = 0.5
-    cos_125 = 0.5 * (1.0 + math.cos(math.pi * 0.125))
-    assert lr_for("bb_top", 450, spe, epochs) == pytest.approx(2e-5 * cos_125 * 0.5)
+    # Stage 4 start (step 600): warm layers step up to cosine peak; newly unfrozen ramp
+    assert lr_for("head", 600, spe, epochs) == pytest.approx(2e-4)
+    assert lr_for("bb_top2", 600, spe, epochs) == pytest.approx(2e-5)       # Clean step, no plunge
+    assert lr_for("bb_top1", 600, spe, epochs) == pytest.approx(1.5e-5)     # Clean step, no plunge
+    assert lr_for("bb_mid", 600, spe, epochs) == pytest.approx(1e-5 * 0.05) # Ramped
+    assert lr_for("bb_bot", 600, spe, epochs) == pytest.approx(5e-6 * 0.05) # Ramped
 
-    # Step = 500 (Epoch 5, post-ramp in Stage 3):
-    # ep3 = 1.0 -> p = 1.0 / 4.0 = 0.25 -> cos(pi * 0.25)
+    # Stage 4 post-ramp (step 700): 100 steps in, all layers on cosine curve
     cos_25 = 0.5 * (1.0 + math.cos(math.pi * 0.25))
-    assert lr_for("head", 500, spe, epochs) == pytest.approx(2e-4 * cos_25)
-    assert lr_for("bb_top", 500, spe, epochs) == pytest.approx(2e-5 * cos_25)
+    assert lr_for("bb_top2", 700, spe, epochs) == pytest.approx(2e-5 * cos_25)
+    assert lr_for("bb_mid", 700, spe, epochs) == pytest.approx(1e-5 * cos_25)
 
-    # Step = 800 (Epoch 8, End): All decayed near 0
-    assert lr_for("head", 800, spe, epochs) == pytest.approx(0.0, abs=1e-8)
-    assert lr_for("bb_top", 800, spe, epochs) == pytest.approx(0.0, abs=1e-8)
+    # End (step 1000): Decayed to zero
+    assert lr_for("head", 1000, spe, epochs) == pytest.approx(0.0, abs=1e-8)
+
+
+def test_soft_supervision_silent_only_routing() -> None:
+    """Verify that impute_soft_synovitis applies strictly to silent non-gold rows."""
+    df = pd.DataFrame({
+        "StudyInstanceUID": ["u1", "u2", "u3", "u4"],
+        "is_gold": [0, 0, 0, 1],
+        "Synovitis": [np.nan, 1.0, 0.0, np.nan],
+        "synovitis_soft": [0.63, 0.22, 0.63, 0.22],
+    })
+    label_cols = ["Synovitis"]
+
+    n = impute_soft_synovitis(df, label_cols)
+    assert n == 1
+    assert df.loc[0, "Synovitis"] == 0.63       # Non-gold silent row imputed
+    assert df.loc[1, "Synovitis"] == 1.0        # Non-gold explicit positive PRESERVED
+    assert df.loc[2, "Synovitis"] == 0.0        # Non-gold explicit negative PRESERVED
+    assert np.isnan(df.loc[3, "Synovitis"])     # Gold row NEVER modified
+
+
+def test_checkpoint_eligibility_stage4_restriction() -> None:
+    """Verify stage4_start_for helper strictly enforces Stage 4 threshold."""
+    assert stage4_start_for(10) == 7
+    assert stage4_start_for(8) == 7
+    assert stage4_start_for(6) == 1
+    assert stage4_start_for(4) == 1
+
+
+def test_collective_validation_loss_device_and_finite() -> None:
+    """Verify compute_collective_val_loss computes finite loss on CPU and asserts finite output."""
+    device = torch.device("cpu")
+    pos_weights = torch.ones(12, dtype=torch.float32, device=device)
+    criterion = MaskedBCEWithLogitsLoss(pos_weight=pos_weights)
+
+    val_records = [
+        {"study_id": f"s_{i}", "logits": [0.5] * 12, "targets": [1.0] * 12, "is_gold": 0}
+        for i in range(4)
+    ]
+    val_logits_np = np.array([r["logits"] for r in val_records])
+    val_targets_np = np.array([r["targets"] for r in val_records])
+    val_is_gold_np = np.array([r["is_gold"] for r in val_records])
+
+    loss = compute_collective_val_loss(val_logits_np, val_targets_np, val_is_gold_np, criterion, device)
+    assert math.isfinite(loss)
+    assert loss > 0.0
+
+
+def test_collective_validation_loss_raises_on_non_finite() -> None:
+    """Verify compute_collective_val_loss raises RuntimeError when loss is non-finite."""
+    device = torch.device("cpu")
+    val_logits_np = np.array([[float("inf")] * 12])
+    val_targets_np = np.array([[1.0] * 12])
+    val_is_gold_np = np.array([0])
+
+    with pytest.raises(RuntimeError, match="non-finite"):
+        compute_collective_val_loss(val_logits_np, val_targets_np, val_is_gold_np, criterion=None, device=device)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GPU loss validation")
+def test_collective_validation_loss_gpu_device_match() -> None:
+    """Verify compute_collective_val_loss runs on CUDA device without tensor mismatch."""
+    device = torch.device("cuda:0")
+    pos_weights = torch.ones(12, dtype=torch.float32, device=device)
+    criterion = MaskedBCEWithLogitsLoss(pos_weight=pos_weights)
+
+    val_logits_np = np.ones((2, 12), dtype=np.float32) * 0.5
+    val_targets_np = np.ones((2, 12), dtype=np.float32)
+    val_is_gold_np = np.zeros(2, dtype=np.int64)
+
+    loss = compute_collective_val_loss(val_logits_np, val_targets_np, val_is_gold_np, criterion, device)
+    assert math.isfinite(loss)
+
+
+def test_gradient_checkpointing_partial_unfreezing() -> None:
+    """Verify that under gradient checkpointing in Stage 2, unfrozen blocks receive non-None gradients."""
+    model = DINOv2SlotHead(pretrained=False)
+    if hasattr(model.backbone, "set_grad_checkpointing"):
+        model.backbone.set_grad_checkpointing(True)
+    apply_unfreezing_stage(model, stage=2)
+
+    imgs = torch.randn(2, 6, 3, 336, 336)
+    masks = torch.ones(2, 6)
+    logits = model(imgs, masks)
+    loss = logits.sum()
+    loss.backward()
+
+    # Frozen early blocks must have None grad
+    assert model.backbone.blocks[0].norm1.weight.grad is None
+    # Unfrozen top blocks and SlotHead queries must have valid non-None grads
+    assert model.backbone.blocks[10].norm1.weight.grad is not None
+    assert model.backbone.blocks[11].norm1.weight.grad is not None
+    assert model.finding_queries.grad is not None
 
 
 def test_ddp_rewrap_with_weakref_release() -> None:

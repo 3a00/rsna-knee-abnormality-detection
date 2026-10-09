@@ -1,8 +1,9 @@
 """scripts/train_ddp_efficiency.py
 
 Dual-GPU DistributedDataParallel (DDP) Training Engine for RSNA Efficiency Track.
-Trains DINOv2-Small SlotHead across Kaggle Dual Tesla T4 GPUs with 3-stage progressive
-unfreezing, LLRD learning rate schedule, and Top-3 checkpoint averaging.
+Trains DINOv2-Small SlotHead across Kaggle Dual Tesla T4 GPUs with 4-stage progressive
+unfreezing, 4-tier LLRD learning rate schedule, continuous soft weak supervision,
+Stage 4-restricted Top-3 checkpoint averaging, and true validation loss telemetry.
 """
 
 from __future__ import annotations
@@ -20,12 +21,10 @@ import sys
 from typing import Any, Sequence
 import weakref
 
-# Ensure project root is first on sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Ensure local user site packages can be discovered as fallback if not present (e.g. for pyarrow, matplotlib)
 user_site = Path.home() / f".local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
 if user_site.is_dir() and str(user_site) not in sys.path:
     sys.path.append(str(user_site))
@@ -44,10 +43,15 @@ from src.models.dinov2_slothead import DINOv2SlotHead
 from src.training.losses import MaskedBCEWithLogitsLoss
 from src.training.metrics import compute_competition_metrics, load_label_columns
 from src.training.train_efficiency import (
+    STAGE4_LR_PEAKS,
     EfficiencyStudyDataset,
     build_differential_optimizer,
+    compute_collective_val_loss,
+    impute_soft_synovitis,
     load_pos_weights,
     seed_everything,
+    stage_for_epoch,
+    stage4_start_for,
 )
 from src.utils.tensorboard import NoOpLogger, TensorBoardLogger
 
@@ -58,61 +62,75 @@ logger = logging.getLogger(__name__)
 def lr_for(family: str, step: int, spe: int, epochs: int) -> float:
     """Compute explicit learning rate for parameter family at the given training step.
 
-    Families:
-      - 'head': Queries, classification head, slot embeddings.
-      - 'bb_top': Blocks 8-11 + final norm.
-      - 'bb_mid': Blocks 4-7.
-      - 'bb_bot': Blocks 0-3, patch_embed, pos_embed, cls_token.
+    Applies a 100-step linear warmup ramp strictly to newly unfrozen layers at each stage boundary.
+    Already-unfrozen layers transition cleanly without downward plunges.
     """
     ep = step / max(1, spe)
 
     if ep < 2.0:
-        # Stage 1: Head warmup and decay, backbone frozen
+        # Stage 1: Head warmup & decay, backbone frozen
         if family != "head":
             return 0.0
         return (1e-4 + 9e-4 * ep) if ep < 1.0 else (1e-3 - 5e-4 * (ep - 1.0))
 
     if ep < 4.0:
-        # Stage 2: Top blocks + Head
+        # Stage 2: Top-2 blocks + Head
         p = (ep - 2.0) / 2.0
         if family == "head":
             return 5e-4 - 2e-4 * p
-        if family == "bb_top":
-            return 1e-5
+        if family == "bb_top2":
+            step_in_stage2 = step - 2 * spe
+            ramp = min(1.0, max(0.05, float(step_in_stage2) / 100.0))
+            return 1e-5 * ramp
         return 0.0
 
-    # Stage 3: All blocks unfrozen, cosine decay to zero with gentle 100-step ramp
-    ep3 = ep - 4.0
-    p = min(1.0, ep3 / max(1.0, float(epochs - 4)))
-    step_in_stage3 = step - 4 * spe
-    ramp = min(1.0, max(0.05, float(step_in_stage3) / 100.0))
+    if ep < 6.0:
+        # Stage 3: Top-4 blocks + Head
+        if family == "head":
+            return 2e-4
+        if family == "bb_top2":
+            return 1.5e-5
+        if family == "bb_top1":
+            step_in_stage3 = step - 4 * spe
+            ramp = min(1.0, max(0.05, float(step_in_stage3) / 100.0))
+            return 1e-5 * ramp
+        return 0.0
 
-    peaks = {
-        "bb_bot": 5e-6,
-        "bb_mid": 1e-5,
-        "bb_top": 2e-5,
-        "head": 2e-4,
-    }
-    peak = peaks.get(family, 2e-4)
+    # Stage 4: All blocks unfrozen, cosine decay to zero
+    ep4 = ep - 6.0
+    p = min(1.0, ep4 / max(1.0, float(epochs - 6)))
+    peak = STAGE4_LR_PEAKS.get(family, 2e-4)
     base = peak * 0.5 * (1.0 + math.cos(math.pi * p))
-    return (base * ramp) if ("bb" in family and step_in_stage3 < 100) else base
+
+    step_in_stage4 = step - 6 * spe
+    if family in ("bb_mid", "bb_bot") and step_in_stage4 < 100:
+        ramp = min(1.0, max(0.05, float(step_in_stage4) / 100.0))
+        return base * ramp
+    return base
 
 
 def apply_unfreezing_stage(raw_model: DINOv2SlotHead, stage: int) -> None:
     """Set parameter requires_grad flags according to unfreezing stage."""
+    for p in raw_model.backbone.parameters():
+        p.requires_grad = False
+
     if stage == 1:
-        for p in raw_model.backbone.parameters():
-            p.requires_grad = False
+        pass
     elif stage == 2:
-        for p in raw_model.backbone.parameters():
-            p.requires_grad = False
-        for p in raw_model.backbone.blocks[8:].parameters():
+        for p in raw_model.backbone.blocks[10:].parameters():
             p.requires_grad = True
         for p in raw_model.backbone.norm.parameters():
             p.requires_grad = True
     elif stage == 3:
+        for p in raw_model.backbone.blocks[8:].parameters():
+            p.requires_grad = True
+        for p in raw_model.backbone.norm.parameters():
+            p.requires_grad = True
+    elif stage == 4:
         for p in raw_model.backbone.parameters():
             p.requires_grad = True
+    else:
+        raise ValueError(f"Unknown unfreezing stage: {stage}")
 
 
 def rewrap_ddp(
@@ -142,11 +160,7 @@ def verify_cache(
     target_size: int = 336,
     crop_mm: float = DEFAULT_CROP_MM,
 ) -> tuple[list[str], list[str]]:
-    """Verify cache manifest provenance and check coverage before spawning DDP.
-
-    Returns:
-        (valid_uids: list[str], empty_uids: list[str])
-    """
+    """Verify cache manifest provenance and check coverage before spawning DDP."""
     d = Path(cache_dir)
     manifest_p = d / "cache_manifest.json"
     if not manifest_p.is_file():
@@ -181,22 +195,33 @@ def verify_cache(
 
 
 def gather_unique_records(
-    records: list[dict[str, Any]],
+    local_records: list[dict[str, Any]],
     world_size: int,
-    device: torch.device | None = None,
 ) -> list[dict[str, Any]]:
-    """Gather evaluation records across all ranks and deduplicate padded sampler entries."""
-    gathered: list[list[dict[str, Any]] | None] = [None] * world_size
-    dist.all_gather_object(gathered, records)
-    unique: dict[str, dict[str, Any]] = {}
-    for rank_recs in gathered:
-        if rank_recs is None:
-            continue
-        for r in rank_recs:
+    """Gather records from all ranks and deduplicate on study_id."""
+    if world_size <= 1:
+        seen = set()
+        unique = []
+        for r in local_records:
             sid = str(r.get("study_id") or r.get("uid") or "")
-            if sid and sid not in unique:
-                unique[sid] = r
-    return list(unique.values())
+            if sid not in seen:
+                seen.add(sid)
+                unique.append(r)
+        return unique
+
+    gathered = [None for _ in range(world_size)]
+    dist.all_gather_object(gathered, local_records)
+
+    all_records = []
+    seen = set()
+    for rank_records in gathered:
+        if rank_records is not None:
+            for r in rank_records:
+                sid = str(r.get("study_id") or r.get("uid") or "")
+                if sid not in seen:
+                    seen.add(sid)
+                    all_records.append(r)
+    return all_records
 
 
 def evaluate_dataset_collective(
@@ -207,8 +232,9 @@ def evaluate_dataset_collective(
     label_cols: list[str],
     is_rank0: bool,
     use_amp: bool = True,
-) -> tuple[float, float, list[dict[str, Any]]]:
-    """Run rank-sharded validation and compute macro AUC on rank 0."""
+    criterion: nn.Module | None = None,
+) -> tuple[float, float, float, list[dict[str, Any]]]:
+    """Run rank-sharded validation and compute macro AUC & true GPU-safe BCE loss on rank 0."""
     ddp_model.eval()
     local_records = []
     with torch.no_grad():
@@ -226,24 +252,32 @@ def evaluate_dataset_collective(
                     "is_gold": int(batch["is_gold"][i].item()),
                 })
 
-    all_val_records = gather_unique_records(local_records, world_size, device)
+    all_val_records = gather_unique_records(local_records, world_size)
 
-    score_11, score_12 = 0.0, 0.0
+    score_11, score_12, val_loss = 0.0, 0.0, 0.0
     if is_rank0:
-        val_logits = np.array([r["logits"] for r in all_val_records])
-        val_targets = np.array([r["targets"] for r in all_val_records])
-        val_is_gold = np.array([r["is_gold"] for r in all_val_records])
+        val_logits_np = np.array([r["logits"] for r in all_val_records])
+        val_targets_np = np.array([r["targets"] for r in all_val_records])
+        val_is_gold_np = np.array([r["is_gold"] for r in all_val_records])
 
         metrics = compute_competition_metrics(
-            logits=val_logits,
-            targets=val_targets,
-            gold_mask=val_is_gold,
+            logits=val_logits_np,
+            targets=val_targets_np,
+            gold_mask=val_is_gold_np,
             label_cols=label_cols,
         )
         score_11 = metrics.macro_auc_11
         score_12 = metrics.macro_auc_12
 
-    return score_11, score_12, all_val_records
+        val_loss = compute_collective_val_loss(
+            val_logits_np=val_logits_np,
+            val_targets_np=val_targets_np,
+            val_is_gold_np=val_is_gold_np,
+            criterion=criterion,
+            device=device,
+        )
+
+    return score_11, score_12, val_loss, all_val_records
 
 
 def train_ddp_worker(
@@ -264,10 +298,9 @@ def train_ddp_worker(
             backend=backend,
             rank=local_rank,
             world_size=world_size,
-            timeout=datetime.timedelta(minutes=30),
+            timeout=datetime.timedelta(seconds=1800),
         )
 
-    # Telemetry logger on Rank 0
     tb_logger = NoOpLogger()
     if is_rank0 and args.tb_dir:
         try:
@@ -276,7 +309,6 @@ def train_ddp_worker(
             logger.warning("TensorBoard unavailable (%s); falling back to NoOpLogger.", err)
             tb_logger = NoOpLogger()
 
-    # Ensure output weight directory exists before rank 0 saves
     if is_rank0:
         Path(args.weights_dir).mkdir(parents=True, exist_ok=True)
     if dist.is_initialized():
@@ -287,10 +319,12 @@ def train_ddp_worker(
     labels_p = Path(args.labels_path)
     labels_df = pd.read_parquet(labels_p) if labels_p.suffix == ".parquet" else pd.read_csv(labels_p)
     label_cols = load_label_columns(args.config_path)
-
+    if "is_gold" in labels_df.columns and "is_gold" in splits_df.columns:
+        labels_df = labels_df.drop(columns=["is_gold"])
     merged = splits_df.merge(labels_df, on="StudyInstanceUID", how="inner")
+    if "is_gold" not in merged.columns and "is_gold_x" in merged.columns:
+        merged["is_gold"] = merged["is_gold_x"]
 
-    # Filter out failed UIDs from all data
     if getattr(args, "valid_uids", None) is not None:
         merged = merged[merged["StudyInstanceUID"].astype(str).isin(args.valid_uids)]
 
@@ -298,9 +332,17 @@ def train_ddp_worker(
     train_df = merged[merged[fold_col] != args.fold].reset_index(drop=True)
     val_df = merged[merged[fold_col] == args.fold].reset_index(drop=True)
 
-    # Drop empty studies from training only, preserving true distribution in validation
     if getattr(args, "empty_uids", None) is not None:
         train_df = train_df[~train_df["StudyInstanceUID"].astype(str).isin(args.empty_uids)].reset_index(drop=True)
+
+    # Continuous soft weak supervision for Synovitis
+    if args.soft_synovitis:
+        n_imputed = impute_soft_synovitis(train_df, label_cols)
+        if is_rank0:
+            logger.info("Soft weak supervision active: imputed %d silent non-gold train studies", n_imputed)
+    else:
+        if is_rank0:
+            logger.info("Soft weak supervision disabled (--no-soft-synovitis): silent rows left as NaN")
 
     def _resolve_study_dirs(df_uids: Sequence[Any]) -> list[Path]:
         if args.dicom_root:
@@ -356,7 +398,8 @@ def train_ddp_worker(
         model=raw_model,
         lr_bottom=5e-6,
         lr_mid=1e-5,
-        lr_top=2e-5,
+        lr_top1=1.5e-5,
+        lr_top2=2e-5,
         lr_head=1e-3,
         weight_decay=args.weight_decay,
     )
@@ -372,14 +415,15 @@ def train_ddp_worker(
     ddp_model = None
     top_checkpoints: list[tuple[float, int, Path]] = []
     history: list[dict[str, Any]] = []
+    stage4_start = stage4_start_for(args.epochs)
 
     for epoch in range(1, args.epochs + 1):
-        stage = 1 if epoch <= 2 else (2 if epoch <= 4 else 3)
+        stage = stage_for_epoch(epoch)
+
         if stage != current_stage:
             current_stage = stage
             apply_unfreezing_stage(raw_model, stage)
 
-            # Verifiable caller teardown with weakref assertion
             ref = weakref.ref(ddp_model) if ddp_model is not None else None
             ddp_model = None
             gc.collect()
@@ -395,6 +439,9 @@ def train_ddp_worker(
                 logger.info("Transitioned to Stage %d at Epoch %d", stage, epoch)
 
         ddp_model.train()
+        if current_stage == 1:
+            raw_model.backbone.eval()
+
         train_sampler.set_epoch(epoch)
         optimizer.zero_grad(set_to_none=True)
         epoch_loss_sum = 0.0
@@ -409,7 +456,6 @@ def train_ddp_worker(
             is_accumulating = ((step_idx + 1) % args.grad_accum_steps != 0) and (step_idx + 1 < len(train_loader))
             sync_context = ddp_model.no_sync() if is_accumulating else contextlib.nullcontext()
 
-            # Set explicit learning rates per param group before optimizer step
             for g in optimizer.param_groups:
                 family = g["name"].rsplit("_", 1)[0]
                 g["lr"] = lr_for(family, global_step, steps_per_epoch, args.epochs)
@@ -432,42 +478,46 @@ def train_ddp_worker(
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-        # Clear references to training graph before validation
         logits = loss = raw_loss = None
 
-        # Distributed validation across all ranks
-        score_11, score_12, _ = evaluate_dataset_collective(
-            ddp_model=ddp_model,
-            val_loader=val_loader,
-            device=device,
-            world_size=world_size,
-            label_cols=label_cols,
-            is_rank0=is_rank0,
-            use_amp=args.use_amp,
-        )
+        try:
+            score_11, score_12, val_loss, _ = evaluate_dataset_collective(
+                ddp_model=ddp_model,
+                val_loader=val_loader,
+                device=device,
+                world_size=world_size,
+                label_cols=label_cols,
+                is_rank0=is_rank0,
+                use_amp=args.use_amp,
+                criterion=criterion,
+            )
+        except Exception as val_err:
+            if is_rank0:
+                logger.error("Epoch %d validation failed: %s", epoch, val_err)
+            raise
 
         if is_rank0:
             avg_train_loss = epoch_loss_sum / max(1, step_count)
-            logger.info("Epoch %d Validation Macro AUC 11: %.4f (Macro AUC 12: %.4f)", epoch, score_11, score_12)
+            logger.info("Epoch %d Val Macro AUC 11: %.4f (AUC 12: %.4f, Val Loss: %.4f, Train Loss: %.4f)",
+                        epoch, score_11, score_12, val_loss, avg_train_loss)
             tb_logger.log_scalar("val/macro_auc_11", score_11, epoch)
             tb_logger.log_scalar("val/macro_auc_12", score_12, epoch)
+            tb_logger.log_scalar("val/loss", val_loss, epoch)
             tb_logger.log_scalar("train/loss", avg_train_loss, epoch)
 
             history.append({
                 "epoch": epoch,
                 "train_loss": float(avg_train_loss),
-                "val_loss": float(score_11),
+                "val_loss": float(val_loss),
                 "macro_auc_11": float(score_11),
                 "macro_auc_12": float(score_12),
                 "score": float(score_11),
             })
 
-            ckpt_path = Path(args.weights_dir) / f"dinov2_slothead_epoch_{epoch:02d}.pth"
-            torch.save({"model_state_dict": raw_model.state_dict(), "epoch": epoch, "score": score_11}, ckpt_path)
-
-            # Top-3 tracking strictly in Stage 3 (epoch >= 5 when total epochs >= 5, else epoch >= 1)
-            stage3_start = 5 if args.epochs >= 5 else 1
-            if epoch >= stage3_start and not math.isnan(score_11):
+            # Save and track checkpoints strictly in Stage 4 (zero intermediate disk writes in Stages 1-3)
+            if epoch >= stage4_start and not math.isnan(score_11):
+                ckpt_path = Path(args.weights_dir) / f"dinov2_slothead_epoch_{epoch:02d}.pth"
+                torch.save({"model_state_dict": raw_model.state_dict(), "epoch": epoch, "score": score_11}, ckpt_path)
                 top_checkpoints.append((score_11, epoch, ckpt_path))
                 top_checkpoints.sort(key=lambda x: x[0], reverse=True)
                 if len(top_checkpoints) > 3:
@@ -475,7 +525,6 @@ def train_ddp_worker(
                     if old_p.is_file():
                         old_p.unlink()
 
-    # Top-3 Checkpoint Averaging & Collective Validation
     averaged_success = False
     top3_path = Path(args.weights_dir) / "dinov2_slothead_top3.pth"
     best_single_path = Path(args.weights_dir) / "dinov2_slothead_best_single.pth"
@@ -488,7 +537,7 @@ def train_ddp_worker(
 
         if len(top_checkpoints) >= 2:
             top_paths = [p for _, _, p in top_checkpoints[:3]]
-            logger.info("Averaging Stage-3 checkpoints: %s", [p.name for p in top_paths])
+            logger.info("Averaging Stage-4 checkpoints: %s", [p.name for p in top_paths])
             state_dicts = [torch.load(p, map_location="cpu")["model_state_dict"] for p in top_paths]
             avg_state = {}
             for k in state_dicts[0]:
@@ -496,15 +545,13 @@ def train_ddp_worker(
             torch.save(avg_state, top3_path)
             averaged_success = True
 
-    # Broadcast averaging status to all ranks
     avg_flag = [averaged_success]
     dist.broadcast_object_list(avg_flag, src=0)
 
     recommended_path = best_single_path if best_single_path.is_file() else None
     if avg_flag[0]:
-        # Collective evaluation of the averaged weights
         raw_model.load_state_dict(torch.load(top3_path, map_location=device))
-        ens_score, _, _ = evaluate_dataset_collective(
+        ens_score, _, _, _ = evaluate_dataset_collective(
             ddp_model=ddp_model,
             val_loader=val_loader,
             device=device,
@@ -512,20 +559,20 @@ def train_ddp_worker(
             label_cols=label_cols,
             is_rank0=is_rank0,
             use_amp=args.use_amp,
+            criterion=criterion,
         )
         if is_rank0:
             best_single_score = top_checkpoints[0][0] if top_checkpoints else 0.0
             logger.info("Ensemble Top-3 AUC 11: %.4f vs Best Single Epoch AUC 11: %.4f", ens_score, best_single_score)
-            if ens_score >= best_single_score:
-                recommended_path = top3_path
-            else:
-                recommended_path = best_single_path
+            recommended_path = top3_path if ens_score >= best_single_score else best_single_path
 
     if is_rank0:
         chosen_auc_11 = ens_score if (averaged_success and ens_score is not None) else (top_checkpoints[0][0] if top_checkpoints else None)
+        valid_losses = [h["val_loss"] for h in history if math.isfinite(h.get("val_loss", float("nan")))]
         results_summary = {
             "history": history,
             "averaged_macro_auc_11": float(chosen_auc_11) if chosen_auc_11 is not None else None,
+            "best_val_loss": float(min(valid_losses)) if valid_losses else None,
             "recommended_weights": str(recommended_path) if recommended_path and recommended_path.is_file() else None,
             "recommended_weights_path": str(recommended_path) if recommended_path and recommended_path.is_file() else None,
             "top3_averaged": str(top3_path) if averaged_success else None,
@@ -544,7 +591,7 @@ def train_ddp_worker(
 def main() -> None:
     parser = argparse.ArgumentParser(description="DDP Training Runner for RSNA Efficiency Track")
     parser.add_argument("--fold", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--img-size", type=int, default=336)
@@ -559,6 +606,7 @@ def main() -> None:
     parser.add_argument("--weights-path", type=str, default=None)
     parser.add_argument("--allow-random-init", action="store_true", default=False)
     parser.add_argument("--slot-dropout-p", type=float, default=0.0)
+    parser.add_argument("--soft-synovitis", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--weights-dir", type=str, default="outputs/weights")
     parser.add_argument("--tb-dir", type=str, default="outputs/tensorboard")
     parser.add_argument("--dicom-root", type=str, default=None)
@@ -569,11 +617,24 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=2)
     args = parser.parse_args()
 
-    # Pre-spawn fail-closed weights guard
     if not args.weights_path and not args.allow_random_init:
         raise ValueError("Must supply --weights-path or explicitly pass --allow-random-init.")
 
-    # Pre-spawn 100% cache verification
+    # Pre-spawn validation on labels and splits files to fail fast in <1s before CUDA context or multiprocessing spawn
+    labels_p = Path(args.labels_path)
+    if not labels_p.is_file():
+        raise FileNotFoundError(f"Missing labels file: {labels_p}")
+    splits_p = Path(args.splits_path)
+    if not splits_p.is_file():
+        raise FileNotFoundError(f"Missing splits file: {splits_p}")
+
+    chk_df = pd.read_parquet(labels_p) if labels_p.suffix == ".parquet" else pd.read_csv(labels_p, nrows=20)
+    chk_splits = pd.read_parquet(splits_p) if splits_p.suffix == ".parquet" else pd.read_csv(splits_p, nrows=20)
+    if "is_gold" not in chk_df.columns and "is_gold" not in chk_splits.columns:
+        raise KeyError(f"Neither labels file ({labels_p}) nor splits file ({splits_p}) contains required 'is_gold' column.")
+    if args.soft_synovitis and "synovitis_soft" not in chk_df.columns:
+        raise KeyError(f"Labels file at {labels_p} missing required 'synovitis_soft' column for soft supervision.")
+
     if args.require_cache and args.cache_dir:
         splits_df = pd.read_csv(args.splits_path)
         uids = splits_df["StudyInstanceUID"].astype(str).tolist()

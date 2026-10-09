@@ -364,108 +364,159 @@ def load_labels_and_splits(
     return train_df, val_df, label_cols
 
 
+STAGE4_LR_PEAKS: dict[str, float] = {
+    "bb_bot": 5e-6,
+    "bb_mid": 1e-5,
+    "bb_top1": 1.5e-5,
+    "bb_top2": 2e-5,
+    "head": 2e-4,
+}
+
+
+def stage_for_epoch(epoch: int) -> int:
+    """Return progressive unfreezing stage (1..4) for given 1-indexed epoch."""
+    if epoch <= 2:
+        return 1
+    if epoch <= 4:
+        return 2
+    if epoch <= 6:
+        return 3
+    return 4
+
+
+def stage4_start_for(epochs: int) -> int:
+    """Return first epoch eligible for Top-3 checkpoint averaging (debug fallback if epochs < 7)."""
+    return 7 if epochs >= 7 else 1
+
+
+def _param_family(name: str) -> str:
+    """Map parameter name to its LLRD family."""
+    if not name.startswith("backbone."):
+        return "head"
+    if "blocks." in name:
+        try:
+            idx = int(name.split("blocks.")[1].split(".")[0])
+            if idx < 4:
+                return "bb_bot"
+            if idx < 8:
+                return "bb_mid"
+            if idx < 10:
+                return "bb_top1"
+            return "bb_top2"
+        except (IndexError, ValueError):
+            return "bb_top2"
+    if "norm" in name:
+        return "bb_top2"
+    return "bb_bot"  # patch_embed, pos_embed, cls_token
+
+
+def _is_no_decay(name: str, p: torch.Tensor) -> bool:
+    """Determine whether parameter is excluded from weight decay."""
+    return (
+        p.ndim < 2
+        or "bias" in name
+        or "norm" in name
+        or "pos_embed" in name
+        or "cls_token" in name
+        or any(t in name for t in ("slot_embed", "finding_queries"))
+    )
+
+
 def build_differential_optimizer(
     model: nn.Module,
     lr_bottom: float = 5e-6,
     lr_mid: float = 1e-5,
-    lr_top: float = 2e-5,
+    lr_top1: float = 1.5e-5,
+    lr_top2: float = 2e-5,
     lr_head: float = 1e-3,
     weight_decay: float = 0.05,
-    lr_backbone: float | None = None,
 ) -> torch.optim.AdamW:
-    """Build AdamW optimizer with layer-wise learning rate decay (LLRD) and weight decay exclusions.
+    """Build AdamW optimizer with 4-tier layer-wise learning rate decay (LLRD) across 10 parameter groups."""
+    rates = {
+        "bb_bot": lr_bottom,
+        "bb_mid": lr_mid,
+        "bb_top1": lr_top1,
+        "bb_top2": lr_top2,
+        "head": lr_head,
+    }
 
-    If lr_backbone is explicitly provided (legacy single-GPU mode), returns 4 parameter groups:
-      0: Backbone 2D weights (lr=lr_backbone, weight_decay=weight_decay)
-      1: Backbone 1D/biases/LayerNorm/pos_embed (lr=lr_backbone, weight_decay=0.0)
-      2: SlotHead 2D weights (lr=lr_head, weight_decay=weight_decay)
-      3: SlotHead 1D/biases/LayerNorm/queries/slot_embed (lr=lr_head, weight_decay=0.0)
-
-    Otherwise (LLRD mode for DDP and 3-stage schedule), returns 8 parameter groups:
-      0, 1: Backbone Bottom (patch_embed, cls_token, pos_embed, Blocks 0-3: lr=lr_bottom, wd=weight_decay / 0.0)
-      2, 3: Backbone Mid (Blocks 4-7: lr=lr_mid, wd=weight_decay / 0.0)
-      4, 5: Backbone Top (Blocks 8-11 + Norm: lr=lr_top, wd=weight_decay / 0.0)
-      6, 7: SlotHead queries, embeddings, attention & heads (lr=lr_head, wd=weight_decay / 0.0)
-    """
-    no_decay_head = {"slot_embed", "finding_queries"}
-
-    if lr_backbone is not None:
-        bb_decay, bb_no_decay = [], []
-        hd_decay, hd_no_decay = [], []
-
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            is_backbone = name.startswith("backbone.")
-            is_no_decay = (
-                p.ndim < 2
-                or "bias" in name
-                or "norm" in name
-                or "pos_embed" in name
-                or "cls_token" in name
-                or any(t in name for t in no_decay_head)
-            )
-            if is_backbone:
-                (bb_no_decay if is_no_decay else bb_decay).append(p)
-            else:
-                (hd_no_decay if is_no_decay else hd_decay).append(p)
-
-        param_groups = [
-            {"params": bb_decay, "lr": lr_backbone, "weight_decay": weight_decay},
-            {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0},
-            {"params": hd_decay, "lr": lr_head, "weight_decay": weight_decay},
-            {"params": hd_no_decay, "lr": lr_head, "weight_decay": 0.0},
-        ]
-        return torch.optim.AdamW(param_groups)
-
-    bb_bot_d, bb_bot_nd = [], []
-    bb_mid_d, bb_mid_nd = [], []
-    bb_top_d, bb_top_nd = [], []
-    hd_d, hd_nd = [], []
+    groups: dict[str, list[torch.Tensor]] = {
+        f"{fam}_{suffix}": []
+        for fam in ("bb_bot", "bb_mid", "bb_top1", "bb_top2", "head")
+        for suffix in ("decay", "nodecay")
+    }
 
     for name, p in model.named_parameters():
-        is_backbone = name.startswith("backbone.")
-        is_no_decay = (
-            p.ndim < 2
-            or "bias" in name
-            or "norm" in name
-            or "pos_embed" in name
-            or "cls_token" in name
-            or any(t in name for t in no_decay_head)
-        )
-
-        if is_backbone:
-            block_idx = -1
-            if "blocks." in name:
-                try:
-                    block_idx = int(name.split("blocks.")[1].split(".")[0])
-                except (IndexError, ValueError):
-                    block_idx = 11
-
-            # Patch_embed, pos_embed, cls_token route to bottom
-            if block_idx == -1 and "norm" not in name:
-                block_idx = 0
-
-            if block_idx in range(0, 4):
-                (bb_bot_nd if is_no_decay else bb_bot_d).append(p)
-            elif block_idx in range(4, 8):
-                (bb_mid_nd if is_no_decay else bb_mid_d).append(p)
-            else:  # blocks 8-11 or backbone.norm
-                (bb_top_nd if is_no_decay else bb_top_d).append(p)
-        else:
-            (hd_nd if is_no_decay else hd_d).append(p)
+        fam = _param_family(name)
+        suffix = "nodecay" if _is_no_decay(name, p) else "decay"
+        groups[f"{fam}_{suffix}"].append(p)
 
     param_groups = [
-        {"params": bb_bot_d, "lr": lr_bottom, "weight_decay": weight_decay, "name": "bb_bot_decay"},
-        {"params": bb_bot_nd, "lr": lr_bottom, "weight_decay": 0.0, "name": "bb_bot_nodecay"},
-        {"params": bb_mid_d, "lr": lr_mid, "weight_decay": weight_decay, "name": "bb_mid_decay"},
-        {"params": bb_mid_nd, "lr": lr_mid, "weight_decay": 0.0, "name": "bb_mid_nodecay"},
-        {"params": bb_top_d, "lr": lr_top, "weight_decay": weight_decay, "name": "bb_top_decay"},
-        {"params": bb_top_nd, "lr": lr_top, "weight_decay": 0.0, "name": "bb_top_nodecay"},
-        {"params": hd_d, "lr": lr_head, "weight_decay": weight_decay, "name": "head_decay"},
-        {"params": hd_nd, "lr": lr_head, "weight_decay": 0.0, "name": "head_nodecay"},
+        {
+            "params": groups[f"{fam}_{suffix}"],
+            "lr": rates[fam],
+            "weight_decay": 0.0 if suffix == "nodecay" else weight_decay,
+            "name": f"{fam}_{suffix}",
+        }
+        for fam in ("bb_bot", "bb_mid", "bb_top1", "bb_top2", "head")
+        for suffix in ("decay", "nodecay")
     ]
     return torch.optim.AdamW(param_groups)
+
+
+def impute_soft_synovitis(train_df: pd.DataFrame, label_cols: Sequence[str]) -> int:
+    """Impute continuous soft weak labels for silent non-gold Synovitis rows per ADR-0001.
+
+    Fails fast if required columns are absent or if zero silent rows were updated.
+
+    Returns:
+        Number of studies updated.
+    """
+    if "Synovitis" not in label_cols:
+        return 0
+    if "is_gold" not in train_df.columns:
+        raise KeyError("Missing required 'is_gold' column in train labels DataFrame.")
+    if "synovitis_soft" not in train_df.columns:
+        raise KeyError("Missing required 'synovitis_soft' column in train labels DataFrame.")
+
+    non_gold_mask = train_df["is_gold"] == 0
+    is_silent = train_df["Synovitis"].isna() | (train_df["Synovitis"] == -1)
+    impute_mask = non_gold_mask & is_silent & train_df["synovitis_soft"].notna()
+    n_imputed = int(impute_mask.sum())
+
+    if is_silent.any() and n_imputed == 0:
+        raise RuntimeError(
+            "Silent non-gold rows exist in Synovitis, but zero were imputed with synovitis_soft. "
+            "Verify that synovitis_soft column contains valid continuous probabilities."
+        )
+
+    train_df.loc[impute_mask, "Synovitis"] = train_df.loc[impute_mask, "synovitis_soft"].astype(float)
+    return n_imputed
+
+
+def compute_collective_val_loss(
+    val_logits_np: np.ndarray,
+    val_targets_np: np.ndarray,
+    val_is_gold_np: np.ndarray,
+    criterion: nn.Module | None,
+    device: torch.device,
+) -> float:
+    """Compute collective validation loss on device, asserting finite output."""
+    t_logits = torch.as_tensor(val_logits_np, dtype=torch.float32, device=device)
+    t_targets = torch.as_tensor(val_targets_np, dtype=torch.float32, device=device)
+
+    if criterion is not None:
+        t_is_gold = torch.as_tensor(val_is_gold_np, dtype=torch.float32, device=device)
+        val_loss = float(criterion(t_logits, t_targets, is_gold=t_is_gold).item())
+    else:
+        valid_m = ~torch.isnan(t_targets)
+        val_loss = float(nn.functional.binary_cross_entropy_with_logits(
+            t_logits[valid_m], t_targets[valid_m]
+        ).item()) if valid_m.any() else 0.0
+
+    if not math.isfinite(val_loss):
+        raise RuntimeError(f"Validation loss is non-finite: {val_loss}")
+    return val_loss
 
 
 def _register_checkpoint(
@@ -759,9 +810,13 @@ def train_efficiency_fold(
     )
 
     # Optimizer and OneCycleLR scheduler
+    bb_lr = lr_backbone if lr_backbone is not None else 2e-5
     optimizer = build_differential_optimizer(
         model=model,
-        lr_backbone=lr_backbone,
+        lr_bottom=bb_lr * 0.25,
+        lr_mid=bb_lr * 0.5,
+        lr_top1=bb_lr * 0.75,
+        lr_top2=bb_lr,
         lr_head=lr_head,
         weight_decay=weight_decay,
     )
@@ -769,7 +824,7 @@ def train_efficiency_fold(
     total_steps = max(1, steps_per_epoch * n_epochs)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[lr_backbone, lr_backbone, lr_head, lr_head],
+        max_lr=[g["lr"] for g in optimizer.param_groups],
         total_steps=total_steps,
         pct_start=pct_start,
     )

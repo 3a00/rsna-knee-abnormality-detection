@@ -202,13 +202,13 @@ notebook = {
                 "subprocess.run(preprocess_cmd, check=True)\n"
             ]
         },
-        # Cell 5: Dual-T4 DistributedDataParallel Full Training (8 Epochs, ~18 min)
+        # Cell 5: Dual-T4 DistributedDataParallel Full Training (10 Epochs)
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "## Cell 5: Dual-T4 DistributedDataParallel Full Training (8 Epochs, ~18 min)\n",
-                "Trains DINOv2-Small SlotHead with dynamic depth jitter, symmetry-preserving augmentations, and 3-stage progressive unfreezing."
+                "## Cell 5: Dual-T4 DistributedDataParallel Full Training (10 Epochs)\n",
+                "Trains DINOv2-Small SlotHead with dynamic depth jitter, symmetry-preserving augmentations, and 4-stage progressive unfreezing."
             ]
         },
         {
@@ -220,7 +220,7 @@ notebook = {
                 "train_cmd = [\n",
                 "    sys.executable, 'scripts/train_ddp_efficiency.py',\n",
                 "    '--fold', '0',\n",
-                "    '--epochs', '8',\n",
+                "    '--epochs', '10',\n",
                 "    '--batch-size', '4',\n",
                 "    '--grad-accum-steps', '1',\n",
                 "    '--img-size', '336',\n",
