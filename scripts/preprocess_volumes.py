@@ -1,323 +1,284 @@
-"""
-preprocess_volumes.py -- One-Time DICOM Preprocessing Cache for Phase 3 Training
+"""scripts/preprocess_volumes.py
 
-Why this exists:
-    Decoding full DICOM studies inside __getitem__ (during training) costs ~1.3s/study
-    on Kaggle's network-mounted storage. With num_workers=0, this keeps the GPU idle
-    >90% of wall time: 50 epochs x 4407 studies = 85+ hours. Unacceptable.
-
-    This script decodes each study ONCE, picks the best series per plane, selects N
-    slices, resizes, normalizes, and saves float32->uint8 .npz to local scratch.
-    Subsequent __getitem__ becomes a simple np.load (~5ms) instead of ~1300ms.
-
-    Expected speedup: 50-200x per epoch. Full 5-fold 10-epoch run drops from ~85h
-    to ~3-5h on Kaggle T4.
-
-Usage (Cell 4 in notebook, before training):
-    from scripts.preprocess_volumes import preprocess_dataset
-    preprocess_dataset(
-        train_df=train_df,
-        dicom_root=dicom_root,
-        cache_dir="/kaggle/tmp/rsna_cache",
-        cfg=cfg,
-        n_workers=4,
-    )
-
-Output layout:
-    cache_dir/
-        {StudyInstanceUID}.npz  -- keys: "sagittal", "coronal", "axial", "plane_present"
-                                    shapes: (N, H, W) uint8, (3,) bool
+One-Time 5-Slice DICOM Preprocessing Cache for RSNA Efficiency Track Training.
+Pre-extracts 5 centered physical slices per present slot into session scratch.
+Features atomic file writes, pool initializer thread hygiene, and manifest verification.
 """
 
 from __future__ import annotations
 
+import argparse
+from concurrent.futures import ProcessPoolExecutor
+import json
+import logging
 import os
-import sys
-import warnings
 from pathlib import Path
-from typing import Optional
+import shutil
+import sys
+import time
+from typing import Any
 
-import numpy as np
+# Ensure project root is on sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import cv2
 import pandas as pd
+import torch
+
+from src.datasets.efficiency_pipeline import (
+    DEFAULT_CROP_MM,
+    load_series_metadata,
+    process_study_to_5slice_cache,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+_worker_series_metadata: dict | None = None
 
 
-# ============================================================================
-# Helpers
-# ============================================================================
-
-def _uid_to_seed(study_uid: str) -> int:
-    """Derive a stable, process-independent seed from a StudyInstanceUID string.
-
-    Uses hashlib.md5 instead of Python's built-in hash() because:
-      - Python hash() is salted per-process (PYTHONHASHSEED) since Python 3.3.
-      - In multiprocessing.Pool(spawn), each worker process has a DIFFERENT salt,
-        so hash(uid) returns different values in different workers.
-      - hashlib.md5 is deterministic across processes, machines, and Python versions.
-
-    The seed is truncated to 8 hex chars -> int fits within numpy's seed range.
-    Must be identical in preprocess_volumes.py AND mri_dataset.py.
-    """
-    import hashlib
-    return int(hashlib.md5(study_uid.encode()).hexdigest()[:8], 16)
+def _init_pool_worker(series_metadata: dict | None) -> None:
+    """Initialize worker process: bind metadata and clamp intra-op threads."""
+    global _worker_series_metadata
+    _worker_series_metadata = series_metadata
+    torch.set_num_threads(1)
+    cv2.setNumThreads(0)
 
 
-def _select_slices_seeded(
-    volume: np.ndarray,
-    n_slices: int,
-    seed: int,
-    center_weight: float = 2.0,
-) -> np.ndarray:
-    """Center-weighted slice selection with per-study seed (no fixed seed=42).
-
-    The central 50% of the volume gets 2x sampling weight to over-represent
-    the articular space where meniscal tears, cartilage loss, and effusion
-    are most visible.
-
-    Args:
-        volume:        (S, H, W) float32 normalized MRI volume.
-        n_slices:      Target number of slices to select.
-        seed:          Per-study RNG seed derived from StudyInstanceUID hash.
-        center_weight: Weight multiplier for central 50% of slices.
+def _process_single_study(
+    study_uid: str,
+    dicom_root: Path,
+    cache_dir: Path,
+    target_size: int,
+    crop_mm: float,
+) -> tuple[bool, bool]:
+    """Worker task processing and atomically persisting a single study cache.
 
     Returns:
-        (n_slices, H, W) float32 array. Zero-padded if volume < n_slices.
+        (success: bool, is_empty: bool)
     """
-    total = volume.shape[0]
+    out_file = cache_dir / f"{study_uid}.pt"
+    if out_file.is_file():
+        return True, False
 
-    if total <= n_slices:
-        pad = np.zeros((n_slices - total, *volume.shape[1:]), dtype=volume.dtype)
-        return np.concatenate([volume, pad], axis=0)
-
-    weights = np.ones(total, dtype=np.float32)
-    weights[int(total * 0.25):int(total * 0.75)] = center_weight
-    weights /= weights.sum()
-
-    rng = np.random.default_rng(seed=seed)
-    indices = np.sort(rng.choice(total, size=n_slices, replace=False, p=weights))
-    return volume[indices]
-
-
-def _resize_volume(volume: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Resize (S, H, W) volume to (S, target_h, target_w) using bilinear interpolation.
-
-    Done AFTER slice selection so we only resize the N selected slices
-    (not all 60+ raw slices), saving ~(total_slices/n_slices)x wasted cv2 calls.
-    """
-    import cv2
-    return np.stack([
-        cv2.resize(sl, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        for sl in volume
-    ]).astype(np.float32)
-
-
-def _float_to_uint8(volume: np.ndarray) -> np.ndarray:
-    """Convert float32 [0,1] volume to uint8 [0,255] for compact disk storage.
-
-    Storage savings vs float32: 4x (uint8 is 1 byte vs 4 bytes per element).
-    At N=24, 224x224: 24 * 224 * 224 * 3 planes * 1 byte = ~3.6 MB/study (uint8)
-    vs ~14.4 MB/study (float32). Total for 4407 studies: ~16 GB (uint8).
-    """
-    volume = np.clip(volume, 0.0, 1.0)
-    return (volume * 255.0).astype(np.uint8)
-
-
-# ============================================================================
-# Per-Study Worker Function
-# ============================================================================
-
-def _process_one_study(args: tuple) -> tuple[str, Optional[str]]:
-    """Worker function: load one study, preprocess, save .npz to cache_dir.
-
-    Args:
-        args: (study_uid, dicom_root, cache_dir, n_slices, target_size)
-
-    Returns:
-        (study_uid, error_message_or_None)
-    """
-    study_uid, dicom_root_str, cache_dir_str, n_slices, target_size = args
-
-    cache_path = Path(cache_dir_str) / f"{study_uid}.npz"
-    if cache_path.exists():
-        return study_uid, None  # Already cached; skip
+    study_dir = dicom_root / study_uid
+    if not study_dir.is_dir():
+        candidates = list(dicom_root.glob(f"*/{study_uid}"))
+        if candidates and candidates[0].is_dir():
+            study_dir = candidates[0]
+        else:
+            return False, False
 
     try:
-        from src.datasets.dicom_loader import (
-            AnatomicalPlane,
-            SeriesType,
-            load_study_series,
+        tensor, mask = process_study_to_5slice_cache(
+            study_dir=study_dir,
+            series_metadata=_worker_series_metadata,
+            num_workers=0,
+            target_size=target_size,
+            crop_mm=crop_mm,
+            slice_pos=0.5,
         )
-
-        PLANE_ORDER     = [AnatomicalPlane.SAGITTAL, AnatomicalPlane.CORONAL, AnatomicalPlane.AXIAL]
-        SERIES_PRIORITY = [SeriesType.FLUID_SENSITIVE, SeriesType.ANATOMICAL]
-        target_h, target_w = target_size
-        seed = _uid_to_seed(study_uid)
-
-        dicom_root = Path(dicom_root_str)
-        study_dir  = dicom_root / "train_series" / study_uid
-        if not study_dir.exists():
-            study_dir = dicom_root / study_uid
-
-        series_list = load_study_series(str(study_dir))
-
-        arrays: dict[str, np.ndarray] = {}
-        plane_present: list[bool] = []
-
-        for plane in PLANE_ORDER:
-            # Select best series for this plane (fluid-sensitive preferred)
-            candidates = [s for s in series_list if s.plane == plane]
-            chosen = None
-            if candidates:
-                for stype in SERIES_PRIORITY:
-                    typed = [s for s in candidates if s.series_type == stype]
-                    if typed:
-                        chosen = max(typed, key=lambda s: s.n_slices)
-                        break
-                if chosen is None:
-                    chosen = max(candidates, key=lambda s: s.n_slices)
-
-            plane_name = plane.value.lower()  # "sagittal", "coronal", "axial"
-
-            if chosen is None:
-                # No series for this plane -- store zeros, mark absent
-                arrays[plane_name] = np.zeros(
-                    (n_slices, target_h, target_w), dtype=np.uint8
-                )
-                plane_present.append(False)
-            else:
-                volume = chosen.pixel_array  # (S, H, W) float32 normalized [0,1]
-                # FIX: select THEN resize (not resize-all-then-select)
-                volume = _select_slices_seeded(volume, n_slices, seed)  # (N, H, W)
-                volume = _resize_volume(volume, target_h, target_w)      # (N, H, W) resized
-                arrays[plane_name] = _float_to_uint8(volume)             # (N, H, W) uint8
-                plane_present.append(True)
-
-        np.savez_compressed(
-            str(cache_path),
-            sagittal=arrays["sagittal"],
-            coronal=arrays["coronal"],
-            axial=arrays["axial"],
-            plane_present=np.array(plane_present, dtype=bool),
-        )
-        return study_uid, None
-
+        is_empty = bool(mask.sum().item() == 0)
+        payload = {
+            "image": tensor,  # (6, 5, 336, 336) float16
+            "presence_mask": mask,  # (6,) float32
+            "meta": {
+                "target_size": target_size,
+                "crop_mm": float(crop_mm),
+                "n_slices_cached": 5,
+            },
+        }
+        tmp_file = out_file.with_suffix(".pt.tmp")
+        torch.save(payload, tmp_file)
+        os.replace(tmp_file, out_file)
+        return True, is_empty
     except Exception as e:
-        return study_uid, str(e)
+        logger.warning("Failed caching study %s: %s", study_uid, e)
+        return False, False
 
-
-# ============================================================================
-# Public API
-# ============================================================================
 
 def preprocess_dataset(
-    train_df: pd.DataFrame,
-    dicom_root: str,
-    cache_dir: str,
-    cfg: dict,
+    dicom_root: str | Path,
+    cache_dir: str | Path,
+    series_csv: str | Path | None = None,
+    splits_csv: str | Path | None = None,
+    labels_csv: str | Path | None = None,
+    target_size: int = 336,
+    crop_mm: float = DEFAULT_CROP_MM,
     n_workers: int = 4,
-) -> dict:
-    """Preprocess all studies: decode once, select slices, resize, save .npz.
+) -> None:
+    """Pre-caches all training and validation studies into session scratch."""
+    dicom_root = Path(dicom_root)
+    cache_path = Path(cache_dir)
 
-    This is the decisive Phase A fix. Run once per Kaggle session before
-    training starts. Subsequent training epochs load from local .npz files
-    (~5ms/study) instead of re-decoding DICOM (~1300ms/study).
+    try:
+        cache_path.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        logger.error("Cannot create or write to cache directory %s: %s", cache_path, e)
+        raise RuntimeError(f"Cache directory {cache_path} is not writable. Aborting.") from e
 
-    Args:
-        train_df:   DataFrame with at least StudyInstanceUID column (4407 rows).
-        dicom_root: Root path to DICOM data (e.g., /kaggle/input/.../train/).
-        cache_dir:  Output directory for .npz files. Use /kaggle/tmp/rsna_cache
-                    for fast local scratch on Kaggle (persists within session).
-        cfg:        Full config.yaml dict (reads model.n_slices, model.target_size).
-        n_workers:  Number of parallel workers. 4 is safe on Kaggle T4.
+    series_metadata = load_series_metadata(series_csv) if series_csv else None
 
-    Returns:
-        dict with 'n_success', 'n_failed', 'failed_uids' keys.
-    """
-    import time
-    import multiprocessing as mp
+    # Discover StudyInstanceUIDs
+    study_uids: list[str] = []
+    if splits_csv and Path(splits_csv).is_file():
+        df = pd.read_csv(splits_csv)
+        study_uids = df["StudyInstanceUID"].astype(str).unique().tolist()
+    elif labels_csv and Path(labels_csv).is_file():
+        df = pd.read_csv(labels_csv)
+        study_uids = df["StudyInstanceUID"].astype(str).unique().tolist()
+    else:
+        study_uids = [p.name for p in dicom_root.iterdir() if p.is_dir() and not p.name.startswith(".")]
 
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Found %d studies to pre-cache in %s", len(study_uids), cache_path)
+    pending_uids = [u for u in study_uids if not (cache_path / f"{u}.pt").is_file()]
+    logger.info("Pending studies to decode: %d (already cached: %d)", len(pending_uids), len(study_uids) - len(pending_uids))
 
-    n_slices    = cfg["model"]["n_slices"]
-    target_size = tuple(cfg["model"]["target_size"])
-    study_uids  = train_df["StudyInstanceUID"].unique().tolist()
-    n_total     = len(study_uids)
+    # Pre-flight disk space check: compute required bytes (6.8 MB per study)
+    required_bytes = int(len(pending_uids) * 6.8 * 1024 * 1024)
+    free_bytes = shutil.disk_usage(cache_path).free
+    logger.info("Required disk space: %.2f GB (Available: %.2f GB)", required_bytes / 1e9, free_bytes / 1e9)
+    if free_bytes < required_bytes:
+        raise RuntimeError(
+            f"Insufficient disk space in {cache_path}: requires {required_bytes / 1e9:.1f} GB, "
+            f"but only {free_bytes / 1e9:.1f} GB is free."
+        )
 
-    # Check existing cache to skip already-done studies
-    already_done = sum(1 for uid in study_uids if (cache_dir / f"{uid}.npz").exists())
-    n_todo = n_total - already_done
+    # Provenance guard on resume: check existing manifest before continuing
+    manifest_file = cache_path / "cache_manifest.json"
+    existing_pt_files = list(cache_path.glob("*.pt"))
+    old_manifest: dict[str, Any] = {}
 
-    print(f"Preprocessing {n_todo} studies ({already_done} already cached)...")
-    print(f"  cache_dir:   {cache_dir}")
-    print(f"  n_slices:    {n_slices}")
-    print(f"  target_size: {target_size}")
-    print(f"  n_workers:   {n_workers}")
-    sys.stdout.flush()
-
-    if n_todo == 0:
-        print("All studies already cached. Nothing to do.")
-        return {"n_success": n_total, "n_failed": 0, "failed_uids": []}
-
-    args_list = [
-        (uid, dicom_root, str(cache_dir), n_slices, target_size)
-        for uid in study_uids
-    ]
-
-    t_start = time.time()
-    n_success, n_failed = already_done, 0
-    failed_uids: list[str] = []
-
-    # Timing probe: run 3 studies synchronously to estimate total time
-    print("\nRunning timing probe (3 studies)...")
-    sys.stdout.flush()
-    probe_t = time.time()
-    for args in args_list[:3]:
-        _process_one_study(args)
-    probe_elapsed = time.time() - probe_t
-    secs_per_study = probe_elapsed / 3.0
-    projected_total = secs_per_study * n_todo / n_workers
-    print(f"  ~{secs_per_study:.2f}s/study -> projected total: "
-          f"~{projected_total/60:.1f} min with {n_workers} workers")
-    sys.stdout.flush()
-
-    # Run preprocessing (multiprocessing pool)
-    ctx = mp.get_context("spawn")  # "spawn" is safe on Kaggle (avoids fork+CUDA issues)
-    with ctx.Pool(processes=n_workers) as pool:
-        for i, (uid, error) in enumerate(
-            pool.imap_unordered(_process_one_study, args_list)
-        ):
-            if error is None:
-                n_success += 1
-            else:
-                n_failed += 1
-                failed_uids.append(uid)
-                warnings.warn(
-                    f"Failed to preprocess study {uid}: {error}",
-                    UserWarning,
-                    stacklevel=1,
+    if manifest_file.is_file():
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as f:
+                old_manifest = json.load(f)
+            if (
+                int(old_manifest.get("target_size", target_size)) != target_size
+                or abs(float(old_manifest.get("crop_mm", crop_mm)) - crop_mm) > 1e-4
+                or int(old_manifest.get("n_slices_cached", 5)) != 5
+            ):
+                raise RuntimeError(
+                    f"{cache_path} holds a cache with different provenance {old_manifest}; "
+                    f"requested size={target_size}, crop={crop_mm}, slices=5. Please use a fresh directory."
                 )
+        except Exception as e:
+            if "provenance" in str(e):
+                raise
+            logger.warning("Could not parse existing manifest: %s", e)
+    else:
+        if existing_pt_files:
+            raise RuntimeError(
+                f"Found {len(existing_pt_files)} cached .pt files in {cache_path} without cache_manifest.json. "
+                f"Cannot verify provenance of existing files. Clean directory or remove files to proceed."
+            )
+        # Write provenance-first in-progress manifest before processing begins
+        init_manifest = {
+            "target_size": target_size,
+            "crop_mm": float(crop_mm),
+            "n_slices_cached": 5,
+            "total_studies_expected": len(study_uids),
+            "total_cached_files": 0,
+            "failed_uids": [],
+            "empty_uids": [],
+            "in_progress": True,
+            "created_at": time.time(),
+        }
+        manifest_file.write_text(json.dumps(init_manifest, indent=2))
+        logger.info("Initialized in-progress cache manifest at %s", manifest_file)
 
-            # Progress log every 200 studies
-            if (i + 1) % 200 == 0 or (i + 1) == n_total:
-                elapsed = time.time() - t_start
-                pct = (i + 1) / n_total * 100
-                eta_s = elapsed / (i + 1) * (n_total - i - 1) if i > 0 else 0
-                print(
-                    f"  [{i+1:4d}/{n_total}] {pct:5.1f}% | "
-                    f"OK={n_success} FAIL={n_failed} | "
-                    f"Elapsed={elapsed/60:.1f}m ETA={eta_s/60:.1f}m"
-                )
-                sys.stdout.flush()
+    t0 = time.time()
+    this_run_failed: list[str] = []
+    this_run_empty: list[str] = []
+    success_cnt = 0
 
-    total_elapsed = time.time() - t_start
-    print(f"\nPreprocessing complete in {total_elapsed/60:.1f} min.")
-    print(f"  Cached: {n_success}/{n_total} studies")
-    if n_failed > 0:
-        print(f"  Failed: {n_failed} studies (will fall back to live DICOM decode at training time)")
-    sys.stdout.flush()
+    if pending_uids:
+        if n_workers > 1:
+            with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_pool_worker, initargs=(series_metadata,)) as executor:
+                futures = {
+                    executor.submit(_process_single_study, uid, dicom_root, cache_path, target_size, crop_mm): uid
+                    for uid in pending_uids
+                }
+                for idx, fut in enumerate(futures):
+                    uid = futures[fut]
+                    ok, is_empty = fut.result()
+                    if ok:
+                        success_cnt += 1
+                        if is_empty:
+                            this_run_empty.append(uid)
+                    else:
+                        this_run_failed.append(uid)
+                    if (idx + 1) % 100 == 0 or (idx + 1) == len(pending_uids):
+                        elapsed = time.time() - t0
+                        logger.info("Cached [%d/%d] studies (%.1f%%, %.1fs)", idx + 1, len(pending_uids), 100.0 * (idx + 1) / len(pending_uids), elapsed)
+        else:
+            _init_pool_worker(series_metadata)
+            for idx, uid in enumerate(pending_uids):
+                ok, is_empty = _process_single_study(uid, dicom_root, cache_path, target_size, crop_mm)
+                if ok:
+                    success_cnt += 1
+                    if is_empty:
+                        this_run_empty.append(uid)
+                else:
+                    this_run_failed.append(uid)
+                if (idx + 1) % 100 == 0:
+                    logger.info("Cached [%d/%d] studies", idx + 1, len(pending_uids))
 
-    return {
-        "n_success":   n_success,
-        "n_failed":    n_failed,
-        "failed_uids": failed_uids,
+        elapsed = time.time() - t0
+        logger.info("Pre-caching finished: %d succeeded, %d failed, %d empty in %.1fs", success_cnt, len(this_run_failed), len(this_run_empty), elapsed)
+
+    # Accumulate failed and empty UIDs across runs
+    accum_failed = {
+        u for u in set(old_manifest.get("failed_uids", [])) | set(this_run_failed)
+        if not (cache_path / f"{u}.pt").is_file()
     }
+    accum_empty = set(old_manifest.get("empty_uids", [])) | set(this_run_empty)
+
+    manifest_data = {
+        "target_size": target_size,
+        "crop_mm": float(crop_mm),
+        "n_slices_cached": 5,
+        "total_studies_expected": len(study_uids),
+        "total_cached_files": len(list(cache_path.glob("*.pt"))),
+        "failed_uids": sorted(accum_failed),
+        "empty_uids": sorted(accum_empty),
+        "in_progress": False,
+        "updated_at": time.time(),
+    }
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2)
+    logger.info("Wrote cache manifest to %s", manifest_file)
+
+    if len(accum_failed) > max(1, int(0.005 * len(study_uids))):
+        logger.error("Pre-caching failure rate exceeded 0.5%% (%d failures): %s", len(accum_failed), sorted(accum_failed)[:5])
+        sys.exit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Pre-cache 5-slice MRI volumes")
+    parser.add_argument("--dicom-root", type=str, required=True)
+    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache")
+    parser.add_argument("--series-csv", type=str, default=None)
+    parser.add_argument("--splits-csv", type=str, default=None)
+    parser.add_argument("--labels-csv", type=str, default=None)
+    parser.add_argument("--target-size", type=int, default=336)
+    parser.add_argument("--crop-mm", type=float, default=DEFAULT_CROP_MM)
+    parser.add_argument("--num-workers", type=int, default=4)
+    args = parser.parse_args()
+
+    preprocess_dataset(
+        dicom_root=args.dicom_root,
+        cache_dir=args.cache_dir,
+        series_csv=args.series_csv,
+        splits_csv=args.splits_csv,
+        labels_csv=args.labels_csv,
+        target_size=args.target_size,
+        crop_mm=args.crop_mm,
+        n_workers=args.num_workers,
+    )
+
+
+if __name__ == "__main__":
+    main()

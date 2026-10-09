@@ -317,18 +317,18 @@ def route_series_to_slot(plane: str, is_fluid: bool, is_fs: bool) -> Optional[in
 
 
 def crop_and_resize_140mm(
-    img_triplet: np.ndarray,
+    img_volume: np.ndarray,
     pixel_spacing: tuple[float, float],
     target_size: int = 336,
     crop_mm: float = DEFAULT_CROP_MM,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Extract square 140 mm physical FOV centered on image array and resize to target_size x target_size.
+    """Extract square 140 mm physical FOV centered on image array and resize to target_size x target_size for K slices.
     
     Returns:
-        tuple of (cropped_triplet, unpadded_valid_mask)
+        tuple of (cropped_volume, unpadded_valid_mask)
         unpadded_valid_mask is strictly resized to (target_size, target_size) boolean.
     """
-    _, h, w = img_triplet.shape
+    k_slices, h, w = img_volume.shape
     psy = max(float(pixel_spacing[0]), 1e-3)
     psx = max(float(pixel_spacing[1]), 1e-3)
 
@@ -345,8 +345,8 @@ def crop_and_resize_140mm(
         pad_bot = pad_y - pad_top
         pad_left = pad_x // 2
         pad_right = pad_x - pad_left
-        img_triplet = np.pad(
-            img_triplet,
+        img_volume = np.pad(
+            img_volume,
             ((0, 0), (pad_top, pad_bot), (pad_left, pad_right)),
             mode="constant",
             constant_values=0.0,
@@ -357,16 +357,16 @@ def crop_and_resize_140mm(
             mode="constant",
             constant_values=False,
         )
-        _, h, w = img_triplet.shape
+        _, h, w = img_volume.shape
 
     y0 = max(0, (h - req_h) // 2)
     x0 = max(0, (w - req_w) // 2)
-    cropped = img_triplet[:, y0 : y0 + req_h, x0 : x0 + req_w]
+    cropped = img_volume[:, y0 : y0 + req_h, x0 : x0 + req_w]
     cropped_mask = valid_mask[y0 : y0 + req_h, x0 : x0 + req_w]
 
-    out = np.empty((3, target_size, target_size), dtype=np.float32)
+    out = np.empty((k_slices, target_size, target_size), dtype=np.float32)
     interp = cv2.INTER_AREA if (req_h >= target_size and req_w >= target_size) else cv2.INTER_LINEAR
-    for i in range(3):
+    for i in range(k_slices):
         out[i] = cv2.resize(cropped[i], (target_size, target_size), interpolation=interp)
 
     out_mask = cv2.resize(
@@ -378,38 +378,53 @@ def crop_and_resize_140mm(
     return out, out_mask
 
 
-def normalize_triplet_dinov2(
-    triplet: np.ndarray,
+def normalize_volume_dinov2(
+    volume: np.ndarray,
     valid_mask: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, bool]:
     """Per-volume percentile normalization [0.5, 99.5] followed by ImageNet standardization.
 
-    Percentile range is computed strictly on unpadded valid pixels (when valid_mask is
-    provided) so zero-padded borders do not skew contrast. After standardization, padded
-    regions are explicitly re-zeroed so the model sees exactly 0.0 in absent spatial
-    areas rather than the standardized value of a zero pixel (~-2.12).
+    Supports arbitrary slice count K (e.g. K=3 or K=5). For 5-slice volumes, assigns channel
+    statistics such that center triplet [1:4] matches ImageNet RGB standardization bitwise.
     """
     if valid_mask is not None and np.any(valid_mask):
-        unpadded_pixels = triplet[:, valid_mask]
+        unpadded_pixels = volume[:, valid_mask]
     else:
-        unpadded_pixels = triplet
+        unpadded_pixels = volume
 
     p_low, p_high = np.percentile(unpadded_pixels, [0.5, 99.5])
-
     if p_high <= p_low:
-        return np.zeros_like(triplet, dtype=np.float32), False
+        return np.zeros_like(volume, dtype=np.float32), False
 
-    normed = np.clip((triplet - p_low) / (p_high - p_low), 0.0, 1.0)
-    standardized = (normed - IMAGENET_MEAN) / IMAGENET_STD
+    normed = np.clip((volume - p_low) / (p_high - p_low), 0.0, 1.0)
+
+    k = volume.shape[0]
+    if k == 3:
+        mean = IMAGENET_MEAN
+        std = IMAGENET_STD
+    elif k == 5:
+        # Indices [1, 2, 3] map to ImageNet R, G, B ([0.485, 0.456, 0.406])
+        mean = np.array([0.456, 0.485, 0.456, 0.406, 0.456], dtype=np.float32).reshape(5, 1, 1)
+        std = np.array([0.224, 0.229, 0.224, 0.225, 0.224], dtype=np.float32).reshape(5, 1, 1)
+    else:
+        mean = float(np.mean(IMAGENET_MEAN))
+        std = float(np.mean(IMAGENET_STD))
+
+    standardized = (normed - mean) / std
     cleaned = np.nan_to_num(standardized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-    # Re-zero padded borders: zero-padding maps to a non-zero standardized value
-    # (~-2.12 with ImageNet mean/std). Force padded regions back to exactly 0.0
-    # so absent spatial areas are clean zeros for the model.
     if valid_mask is not None and not np.all(valid_mask):
         cleaned[:, ~valid_mask] = 0.0
 
     return cleaned, True
+
+
+def normalize_triplet_dinov2(
+    triplet: np.ndarray,
+    valid_mask: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, bool]:
+    """Per-volume percentile normalization [0.5, 99.5] followed by ImageNet standardization."""
+    return normalize_volume_dinov2(triplet, valid_mask=valid_mask)
 
 
 def deduplicate_multi_echo_slices(headers: Sequence[DICOMHeaderMeta]) -> list[DICOMHeaderMeta]:
@@ -491,6 +506,152 @@ def decode_triplet_slices(paths: list[str]) -> Optional[np.ndarray]:
 
     arrays = [loaded[p] for p in paths]
     return np.stack(arrays, axis=0)
+
+
+def select_5slice_paths(
+    headers: Sequence[DICOMHeaderMeta],
+    slice_pos: float = 0.5,
+) -> list[str]:
+    """Select 5 consecutive physical slices centered around slice_pos.
+
+    Deduplicates multi-echo slices by physical position k, sorts along normal axis,
+    and returns 5 consecutive slice file paths.
+    Edge-replicates if < 5 slices exist via explicit rounding-free center index clipping:
+      c = min(n - 1, int(n * slice_pos))
+      idx = np.clip(np.arange(c - 2, c + 3), 0, n - 1)
+    """
+    deduped = deduplicate_multi_echo_slices(headers)
+    sorted_h = sorted(deduped, key=lambda x: (x.k_pos, x.instance_number, x.path))
+    n = len(sorted_h)
+    if n == 0:
+        return []
+
+    c = min(n - 1, int(n * slice_pos))
+    idx = np.clip(np.arange(c - 2, c + 3), 0, n - 1)
+    return [sorted_h[i].path for i in idx]
+
+
+def decode_slices(paths: Sequence[str]) -> Optional[np.ndarray]:
+    """Decode pixel array strictly for target slices (arbitrary slice count K)."""
+    if not paths:
+        return None
+
+    unique_paths = list(dict.fromkeys(paths))
+    loaded: dict[str, np.ndarray] = {}
+    base_shape = None
+
+    for p in unique_paths:
+        ds = pydicom.dcmread(p)
+        arr = ds.pixel_array.astype(np.float32)
+        if base_shape is None:
+            base_shape = arr.shape
+        elif arr.shape != base_shape:
+            return None
+
+        slope = float(getattr(ds, "RescaleSlope", 1.0))
+        intercept = float(getattr(ds, "RescaleIntercept", 0.0))
+        loaded[p] = arr * slope + intercept
+
+    arrays = [loaded[p] for p in paths]
+    return np.stack(arrays, axis=0)
+
+
+def process_study_to_5slice_cache(
+    study_dir: str | Path,
+    series_metadata: Optional[dict[str, Any]] = None,
+    num_workers: int = 0,
+    target_size: int = 336,
+    crop_mm: float = DEFAULT_CROP_MM,
+    slice_pos: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Process all series in a study directory into 5-slice cached tensor and mask.
+
+    Returns:
+        study_tensor: torch.Tensor of shape (6, 5, target_size, target_size) in float16.
+        presence_mask: torch.Tensor of shape (6,) in float32.
+    """
+    study_path = Path(study_dir)
+    dcm_files = [str(f) for f in sorted(study_path.rglob("*")) if f.is_file() and not f.name.startswith(".")]
+
+    study_tensor = np.zeros((NUM_SLOTS, 5, target_size, target_size), dtype=np.float32)
+    presence_mask = np.zeros(NUM_SLOTS, dtype=np.float32)
+
+    if not dcm_files:
+        return torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+
+    headers: list[DICOMHeaderMeta] = []
+    if num_workers > 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            fn = lambda f: parse_dicom_header_fast(f, series_metadata=series_metadata)
+            for meta, _ in executor.map(fn, dcm_files):
+                if meta is not None:
+                    headers.append(meta)
+    else:
+        for f in dcm_files:
+            meta, _ = parse_dicom_header_fast(f, series_metadata=series_metadata)
+            if meta is not None:
+                headers.append(meta)
+
+    if not headers:
+        return torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+
+    series_groups: dict[str, list[DICOMHeaderMeta]] = {}
+    for h in headers:
+        series_groups.setdefault(h.series_uid, []).append(h)
+
+    slot_cands: dict[int, list[tuple[tuple[int, int, int], str, list[DICOMHeaderMeta]]]] = {}
+
+    for s_uid in sorted(series_groups.keys()):
+        s_headers = series_groups[s_uid]
+        sample = s_headers[0]
+        slot = route_series_to_slot(sample.plane, sample.is_fluid, sample.is_fs)
+        is_fs_flag = int(sample.is_fs)
+
+        if slot is not None:
+            deduped_slices = deduplicate_multi_echo_slices(s_headers)
+            unique_k_cnt = len(deduped_slices)
+            if unique_k_cnt < 1:
+                continue
+
+            k_vals = sorted([h.k_pos for h in deduped_slices])
+            diffs = [abs(k_vals[i + 1] - k_vals[i]) for i in range(len(k_vals) - 1) if abs(k_vals[i + 1] - k_vals[i]) > 1e-4]
+            med_sp = float(np.median(diffs)) if diffs else 3.0
+
+            is_2d = 1 if ((1.5 <= med_sp <= 6.0 and 10 <= unique_k_cnt <= 80) if sample.has_physical_coords else (10 <= unique_k_cnt <= 80)) else 0
+            fs_pri = is_fs_flag if slot in (0, 1, 2) else 0
+            score = (-fs_pri, -is_2d, -unique_k_cnt)
+            slot_cands.setdefault(slot, []).append((score, s_uid, s_headers))
+
+    for slot_idx, cands in slot_cands.items():
+        cands.sort(key=lambda c: (c[0], c[1]))
+        for _, uid, s_headers in cands:
+            slice_paths = select_5slice_paths(s_headers, slice_pos=slice_pos)
+            if not slice_paths:
+                continue
+            try:
+                raw_vol = decode_slices(slice_paths)
+                if raw_vol is None:
+                    continue
+
+                cropped_vol, valid_mask = crop_and_resize_140mm(
+                    raw_vol,
+                    pixel_spacing=s_headers[0].pixel_spacing,
+                    target_size=target_size,
+                    crop_mm=crop_mm,
+                )
+                normed_vol, is_valid = normalize_volume_dinov2(cropped_vol, valid_mask=valid_mask)
+                if not is_valid:
+                    continue
+
+                study_tensor[slot_idx] = normed_vol
+                presence_mask[slot_idx] = 1.0
+                break
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Error processing series %s in study %s: %s", uid, study_path.name, e)
+                continue
+
+    return torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
 
 
 def process_study_to_6slot(

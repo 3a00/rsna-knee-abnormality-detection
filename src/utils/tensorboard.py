@@ -11,8 +11,16 @@ import functools
 import logging
 import re
 from pathlib import Path
+import sys
 from typing import Callable, Protocol, Sequence, runtime_checkable
 import warnings
+
+try:
+    import matplotlib  # type: ignore
+except ImportError:
+    user_site = Path.home() / f".local/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    if user_site.is_dir() and str(user_site) not in sys.path:
+        sys.path.append(str(user_site))
 
 from matplotlib.figure import Figure
 import numpy as np

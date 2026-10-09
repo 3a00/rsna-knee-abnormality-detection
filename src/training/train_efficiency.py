@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import logging
 import math
 from pathlib import Path
@@ -28,12 +29,16 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 import yaml
 
 from src.datasets.efficiency_pipeline import (
     DEFAULT_CROP_MM,
     SLOT_NAMES,
     Fast6SlotDICOMDataset,
+    load_series_metadata,
+    process_study_to_5slice_cache,
 )
 from src.models.dinov2_slothead import DINOv2SlotHead
 from src.training.losses import MaskedBCEWithLogitsLoss
@@ -74,13 +79,63 @@ def load_pos_weights(config_path: str | Path | None = None) -> list[float]:
     return [float(x) for x in weights]
 
 
-class EfficiencyStudyDataset(Dataset):
-    """6-Slot dataset wrapping fast selective DICOM decoding with is_gold indicator.
+def apply_msk_augmentations(img: torch.Tensor, presence_mask: torch.Tensor) -> torch.Tensor:
+    """Per-slot spatial and photometric augmentations for knee MRI.
 
-    Supports pre-extracted tensor caching: if cached_tensor_dir contains {uid}.pt,
-    loads the precomputed (image, presence_mask) tuple directly, bypassing DICOM I/O.
-    Validates cache provenance (target_size and crop_mm) if meta dictionary is present.
-    The underlying Fast6SlotDICOMDataset is constructed lazily on the first cache miss.
+    Guarantees:
+      1. Strictly prohibits horizontal and vertical reflections (no flips).
+      2. Applies independent spatial affine per slot, shared across its 3 channels.
+      3. Uses InterpolationMode.BILINEAR to prevent aliased jagged artifacts.
+      4. Samples dynamic corner median per present slot for fill=[bg] to match real image background.
+      5. Absent slots (presence_mask[i] == 0) are strictly skipped and remain exactly 0.0.
+      6. Isotropic Gaussian blur: samples a single scalar sigma ~ U(0.5, 1.0) and passes [s, s].
+    """
+    s, c, h, w = img.shape
+    out = img.float().clone()
+    max_t = 0.04 * w
+
+    for i in range(s):
+        if presence_mask[i] == 0:
+            continue
+
+        x_i = out[i]
+        corners = torch.cat([
+            x_i[:, :16, :16].flatten(),
+            x_i[:, :16, -16:].flatten(),
+            x_i[:, -16:, :16].flatten(),
+            x_i[:, -16:, -16:].flatten(),
+        ])
+        bg = float(corners.median())
+
+        x = TF.affine(
+            x_i,
+            angle=random.uniform(-7.0, 7.0),
+            translate=[int(round(random.uniform(-max_t, max_t))) for _ in range(2)],
+            scale=random.uniform(0.93, 1.07),
+            shear=[0.0, 0.0],
+            interpolation=InterpolationMode.BILINEAR,
+            fill=[bg],
+        )
+
+        if random.random() < 0.5:
+            x = x * random.uniform(0.90, 1.10) + random.uniform(-0.10, 0.10)
+
+        if random.random() < 0.2:
+            if random.random() < 0.5:
+                x = x + torch.randn_like(x) * 0.02
+            else:
+                sg = random.uniform(0.5, 1.0)
+                x = TF.gaussian_blur(x, kernel_size=[3, 3], sigma=[sg, sg])
+
+        out[i] = x
+
+    return out.to(img.dtype)
+
+
+class EfficiencyStudyDataset(Dataset):
+    """6-Slot dataset wrapping fast selective DICOM decoding with cache provenance & jitter.
+
+    Defaults safely to is_train=False to prevent accidental stochastic jitter during eval/inference.
     """
 
     def __init__(
@@ -94,26 +149,42 @@ class EfficiencyStudyDataset(Dataset):
         crop_mm: float = DEFAULT_CROP_MM,
         cached_tensor_dir: str | Path | None = None,
         num_workers: int = 0,
+        is_train: bool = False,       # Safe default: opt-in during training
+        require_cache: bool = False,  # Fail fast if cache file missing
     ) -> None:
         self.study_uids = [str(u) for u in study_uids]
         self.study_dirs = [Path(d) for d in study_dirs]
         self.labels = np.asarray(labels, dtype=np.float32) if labels is not None else None
         self.is_gold = np.asarray(is_gold, dtype=np.int64) if is_gold is not None else None
         self.series_csv_path = series_csv_path
+        self._series_meta = load_series_metadata(series_csv_path) if series_csv_path else None
         self.target_size = target_size
         self.crop_mm = crop_mm
         self.cached_dir = Path(cached_tensor_dir) if cached_tensor_dir else None
         self.num_workers = num_workers
+        self.is_train = is_train
+        self.require_cache = require_cache
         self._dicom_ds: Fast6SlotDICOMDataset | None = None
 
+        if self.cached_dir is not None:
+            manifest_file = self.cached_dir / "cache_manifest.json"
+            if manifest_file.is_file():
+                with open(manifest_file, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if (
+                    int(meta.get("target_size", self.target_size)) != self.target_size
+                    or abs(float(meta.get("crop_mm", self.crop_mm)) - self.crop_mm) > 1e-4
+                    or int(meta.get("n_slices_cached", 5)) != 5
+                ):
+                    raise RuntimeError(f"Stale cache manifest in {self.cached_dir}: {meta}")
+
     def _get_dicom_ds(self) -> Fast6SlotDICOMDataset:
-        """Lazily instantiate DICOM loader with num_workers=0 to prevent thread pool nesting."""
         if self._dicom_ds is None:
             self._dicom_ds = Fast6SlotDICOMDataset(
                 study_dirs=self.study_dirs,
                 labels=self.labels,
                 series_csv_path=self.series_csv_path,
-                num_workers=0,  # Avoid thread-pool oversubscription when DataLoader workers > 0
+                num_workers=0,
                 target_size=self.target_size,
                 crop_mm=self.crop_mm,
             )
@@ -132,21 +203,33 @@ class EfficiencyStudyDataset(Dataset):
                 cached = torch.load(cache_file, map_location="cpu", weights_only=True)
                 if isinstance(cached, dict):
                     meta = cached.get("meta")
-                    if meta is not None and (
-                        int(meta.get("size", self.target_size)) != self.target_size
-                        or abs(float(meta.get("crop_mm", self.crop_mm)) - self.crop_mm) > 1e-6
-                    ):
-                        raise RuntimeError(
-                            f"Stale cache for {uid}: cached {meta}, requested size={self.target_size}, crop_mm={self.crop_mm}"
-                        )
-                    img = cached["image"]
+                    if meta is not None:
+                        cached_sz = int(meta.get("target_size", meta.get("size", self.target_size)))
+                        cached_crop = float(meta.get("crop_mm", self.crop_mm))
+                        if cached_sz != self.target_size or abs(cached_crop - self.crop_mm) > 1e-4:
+                            raise RuntimeError(f"Stale cache for {uid}: cached {meta}")
+                    img = cached["image"]  # (6, S, 336, 336)
                     mask = cached["presence_mask"]
                 else:
                     img, mask = cached[0], cached[1]
 
+                # Dynamic 2.5D Depth Jitter (guaranteeing contiguous layout)
+                if img.shape[1] == 5:
+                    if self.is_train:
+                        offset = random.randint(0, 2)  # Samples [0:3], [1:4], or [2:5]
+                        img = img[:, offset : offset + 3].contiguous()
+                    else:
+                        img = img[:, 1:4].contiguous()  # Deterministic center triplet
+                elif img.shape[1] != 3:
+                    raise RuntimeError(f"Unexpected slice dimension: {img.shape[1]}")
+
+                # Symmetry-Preserving MSK Augmentations (training only)
+                if self.is_train:
+                    img = apply_msk_augmentations(img, mask.float())
+
                 item: dict[str, Any] = {
                     "study_id": uid,
-                    "image": img,  # float16 kept through loader, cast in train/val loops
+                    "image": img,
                     "presence_mask": mask.float(),
                 }
                 if self.labels is not None:
@@ -157,12 +240,30 @@ class EfficiencyStudyDataset(Dataset):
                     item["is_gold"] = torch.tensor(0, dtype=torch.long)
                 return item
 
-        # Standard DICOM pipeline fallback (lazy instantiation)
-        base_item = self._get_dicom_ds()[idx]
+            elif self.require_cache:
+                raise FileNotFoundError(f"Missing required cache file for study {uid}: {cache_file}")
+
+        # Normalization Parity Fallback: decode 5 slices with series_metadata and slice [1:4]
+        study_dir = self.study_dirs[idx]
+        img_5, mask = process_study_to_5slice_cache(
+            study_dir=study_dir,
+            series_metadata=self._series_meta,
+            target_size=self.target_size,
+            crop_mm=self.crop_mm,
+            slice_pos=0.5,
+        )
+
+        if self.is_train:
+            offset = random.randint(0, 2)
+            img = img_5[:, offset : offset + 3].contiguous().float()
+            img = apply_msk_augmentations(img, mask.float())
+        else:
+            img = img_5[:, 1:4].contiguous().float()
+
         item = {
             "study_id": uid,
-            "image": base_item["image"],
-            "presence_mask": base_item["presence_mask"].float(),
+            "image": img,
+            "presence_mask": mask.float(),
         }
         if self.labels is not None:
             item["labels"] = torch.from_numpy(self.labels[idx])
@@ -265,30 +366,64 @@ def load_labels_and_splits(
 
 def build_differential_optimizer(
     model: nn.Module,
-    lr_backbone: float = 3e-5,
+    lr_bottom: float = 5e-6,
+    lr_mid: float = 1e-5,
+    lr_top: float = 2e-5,
     lr_head: float = 1e-3,
-    weight_decay: float = 0.02,
+    weight_decay: float = 0.05,
+    lr_backbone: float | None = None,
 ) -> torch.optim.AdamW:
-    """Build AdamW optimizer with layer-wise differential learning rates and weight decay exclusions.
+    """Build AdamW optimizer with layer-wise learning rate decay (LLRD) and weight decay exclusions.
 
-    Groups:
+    If lr_backbone is explicitly provided (legacy single-GPU mode), returns 4 parameter groups:
       0: Backbone 2D weights (lr=lr_backbone, weight_decay=weight_decay)
       1: Backbone 1D/biases/LayerNorm/pos_embed (lr=lr_backbone, weight_decay=0.0)
       2: SlotHead 2D weights (lr=lr_head, weight_decay=weight_decay)
       3: SlotHead 1D/biases/LayerNorm/queries/slot_embed (lr=lr_head, weight_decay=0.0)
 
-    Note for Issue 06:
-      This optimizer must be constructed BEFORE wrapping the model in DistributedDataParallel,
-      as parameter names will be prefixed with 'module.backbone.'.
+    Otherwise (LLRD mode for DDP and 3-stage schedule), returns 8 parameter groups:
+      0, 1: Backbone Bottom (patch_embed, cls_token, pos_embed, Blocks 0-3: lr=lr_bottom, wd=weight_decay / 0.0)
+      2, 3: Backbone Mid (Blocks 4-7: lr=lr_mid, wd=weight_decay / 0.0)
+      4, 5: Backbone Top (Blocks 8-11 + Norm: lr=lr_top, wd=weight_decay / 0.0)
+      6, 7: SlotHead queries, embeddings, attention & heads (lr=lr_head, wd=weight_decay / 0.0)
     """
     no_decay_head = {"slot_embed", "finding_queries"}
 
-    bb_decay, bb_no_decay = [], []
-    hd_decay, hd_no_decay = [], []
+    if lr_backbone is not None:
+        bb_decay, bb_no_decay = [], []
+        hd_decay, hd_no_decay = [], []
+
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            is_backbone = name.startswith("backbone.")
+            is_no_decay = (
+                p.ndim < 2
+                or "bias" in name
+                or "norm" in name
+                or "pos_embed" in name
+                or "cls_token" in name
+                or any(t in name for t in no_decay_head)
+            )
+            if is_backbone:
+                (bb_no_decay if is_no_decay else bb_decay).append(p)
+            else:
+                (hd_no_decay if is_no_decay else hd_decay).append(p)
+
+        param_groups = [
+            {"params": bb_decay, "lr": lr_backbone, "weight_decay": weight_decay},
+            {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0},
+            {"params": hd_decay, "lr": lr_head, "weight_decay": weight_decay},
+            {"params": hd_no_decay, "lr": lr_head, "weight_decay": 0.0},
+        ]
+        return torch.optim.AdamW(param_groups)
+
+    bb_bot_d, bb_bot_nd = [], []
+    bb_mid_d, bb_mid_nd = [], []
+    bb_top_d, bb_top_nd = [], []
+    hd_d, hd_nd = [], []
 
     for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
         is_backbone = name.startswith("backbone.")
         is_no_decay = (
             p.ndim < 2
@@ -298,16 +433,37 @@ def build_differential_optimizer(
             or "cls_token" in name
             or any(t in name for t in no_decay_head)
         )
+
         if is_backbone:
-            (bb_no_decay if is_no_decay else bb_decay).append(p)
+            block_idx = -1
+            if "blocks." in name:
+                try:
+                    block_idx = int(name.split("blocks.")[1].split(".")[0])
+                except (IndexError, ValueError):
+                    block_idx = 11
+
+            # Patch_embed, pos_embed, cls_token route to bottom
+            if block_idx == -1 and "norm" not in name:
+                block_idx = 0
+
+            if block_idx in range(0, 4):
+                (bb_bot_nd if is_no_decay else bb_bot_d).append(p)
+            elif block_idx in range(4, 8):
+                (bb_mid_nd if is_no_decay else bb_mid_d).append(p)
+            else:  # blocks 8-11 or backbone.norm
+                (bb_top_nd if is_no_decay else bb_top_d).append(p)
         else:
-            (hd_no_decay if is_no_decay else hd_decay).append(p)
+            (hd_nd if is_no_decay else hd_d).append(p)
 
     param_groups = [
-        {"params": bb_decay, "lr": lr_backbone, "weight_decay": weight_decay},
-        {"params": bb_no_decay, "lr": lr_backbone, "weight_decay": 0.0},
-        {"params": hd_decay, "lr": lr_head, "weight_decay": weight_decay},
-        {"params": hd_no_decay, "lr": lr_head, "weight_decay": 0.0},
+        {"params": bb_bot_d, "lr": lr_bottom, "weight_decay": weight_decay, "name": "bb_bot_decay"},
+        {"params": bb_bot_nd, "lr": lr_bottom, "weight_decay": 0.0, "name": "bb_bot_nodecay"},
+        {"params": bb_mid_d, "lr": lr_mid, "weight_decay": weight_decay, "name": "bb_mid_decay"},
+        {"params": bb_mid_nd, "lr": lr_mid, "weight_decay": 0.0, "name": "bb_mid_nodecay"},
+        {"params": bb_top_d, "lr": lr_top, "weight_decay": weight_decay, "name": "bb_top_decay"},
+        {"params": bb_top_nd, "lr": lr_top, "weight_decay": 0.0, "name": "bb_top_nodecay"},
+        {"params": hd_d, "lr": lr_head, "weight_decay": weight_decay, "name": "head_decay"},
+        {"params": hd_nd, "lr": lr_head, "weight_decay": 0.0, "name": "head_nodecay"},
     ]
     return torch.optim.AdamW(param_groups)
 
