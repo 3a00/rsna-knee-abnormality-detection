@@ -4,7 +4,7 @@
 
 **Blocked by:** 07: Efficiency Track Training Stabilization, Anti-Overfitting & Caching Optimization
 
-**Status:** ready-for-agent
+**Status:** completed
 
 - [x] **4-Stage Progressive Backbone Unfreezing Schedule**:
   - In `scripts/train_ddp_efficiency.py`, update `apply_unfreezing_stage(raw_model, stage)` and the outer loop for an explicit 4-stage progression across a 10-epoch budget:
@@ -23,8 +23,8 @@
 - [x] **True Validation Loss Telemetry**:
   - In `evaluate_dataset_collective`, accumulate and return true collective multi-label BCE loss alongside `score_11` and `score_12`.
   - Fix `history`, `ddp_results.json`, and TensorBoard logging so `val_loss` and `tb_logger.log_scalar("val/loss", ...)` reflect true validation loss rather than repeating `macro_auc_11`.
-- [ ] **Notebook & Script Synchronization**:
-  - Update `scripts/make_training_notebook.py` and regenerate `notebooks/rsna_efficiency_training.ipynb` with `--epochs 10`. (Script updated; notebook regeneration scheduled post-review).
+- [x] **Notebook & Script Synchronization**:
+  - Update `scripts/make_training_notebook.py` and regenerate `notebooks/rsna_efficiency_training.ipynb` with `--epochs 10`.
 - [x] **Verification**:
   - Unit tests verify 4-stage parameter requires_grad transitions and optimizer parameter groups.
   - Smoke test verifies DDP execution across all 4 stages without NCCL synchronization stalls or gradient clipping anomalies.
