@@ -86,6 +86,14 @@ _Avoid_: Static single-triplet locking, online full-volume re-decoding.
 Geometric and photometric transformations (mild rotation $\pm 7^\circ$, scale $0.93\text{--}1.07$, translation $\pm 4\%$, contrast $\pm 10\%$) applied uniformly across triplet slices while strictly prohibiting horizontal reflection to prevent swapping medial and lateral anatomical compartments.
 _Avoid_: Horizontal flipping, aggressive elastic distortion.
 
+**Nyquist Tear Resolution**:
+The spatial sampling density threshold (minimum $336 \times 336\text{ px}$ across a 140 mm field of view, keeping patch tokens $\le 5.8\text{ mm}$) mathematically required to prevent focal 1–3 mm meniscal tears and ligament discontinuities from collapsing into sub-pixel blur under 14px ViT patch tokenization.
+_Avoid_: Standard 126px/224px uniform downsampling for ViT backbones.
+
+**Calibrated Soft Weak Supervision**:
+Training supervision using continuous probability targets $[0.0, 1.0]$ derived from multi-lingual LLM extraction with conditional effusion-to-synovitis backoff, penalizing overconfident predictions on hedged clinical findings and providing smooth gradients.
+_Avoid_: Hard 0/1 binary thresholding of extracted report weak labels.
+
 
 
 ## Dataset & Label Semantics
