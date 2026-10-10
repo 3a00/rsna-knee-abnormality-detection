@@ -12,6 +12,7 @@ Comprehensive test suite verifying:
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ from pydicom.dataset import Dataset as DcmDataset, FileMetaDataset
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 
 from src.datasets.efficiency_pipeline import (
@@ -103,7 +105,7 @@ def test_dynamic_depth_jitter_offset_coverage(monkeypatch) -> None:
         )
         val_item = ds_val[0]
         assert val_item["image"].shape == (6, 3, 336, 336)
-        assert torch.allclose(val_item["image"], tensor_5[:, 1:4])
+        assert torch.allclose(val_item["image"], tensor_5[:, 1:4].float())
 
         ds_train = EfficiencyStudyDataset(
             study_uids=[uid],
@@ -185,7 +187,8 @@ def test_aug_no_flip_and_absent_slots_untouched() -> None:
 
 def test_stage_for_epoch_and_lr_alignment() -> None:
     """Verify single source of truth for unfreezing stage boundaries and peaks."""
-    assert [stage_for_epoch(e) for e in range(1, 11)] == [1, 1, 2, 2, 3, 3, 4, 4, 4, 4]
+    assert [stage_for_epoch(e, total_epochs=10) for e in range(1, 11)] == [1, 1, 2, 2, 3, 3, 4, 4, 4, 4]
+    assert [stage_for_epoch(e, total_epochs=14) for e in range(1, 15)] == [1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4]
     assert set(STAGE4_LR_PEAKS.keys()) == {"bb_bot", "bb_mid", "bb_top1", "bb_top2", "head"}
 
 
@@ -518,3 +521,214 @@ def test_train_val_inference_parity() -> None:
 
         # Assert bitwise parity
         assert torch.allclose(val_center_triplet.float(), dataset_triplet.float(), atol=1e-4)
+
+
+def test_dinov2_slothead_336px_shape_contract() -> None:
+    """Verify DINOv2SlotHead instantiates with exact (1, 577, 384) pos_embed shape at 336px."""
+    model = DINOv2SlotHead(img_size=336, pretrained=False)
+    # 1 CLS token + (336 // 14)^2 = 1 + 24*24 = 577 tokens
+    assert model.backbone.pos_embed.shape == (1, 577, 384)
+
+    x = torch.randn(1, 6, 3, 336, 336)
+    mask = torch.ones(1, 6)
+    with torch.no_grad():
+        out = model(x, mask)
+    assert out.shape == (1, 12)
+    assert torch.isfinite(out).all()
+
+
+def test_dinov2_slothead_forward_backbone_eval_parity() -> None:
+    """Verify _forward_backbone block loop matches backbone(x) exactly in eval mode."""
+    model = DINOv2SlotHead(img_size=336, pretrained=False)
+    model.eval()
+
+    x = torch.randn(2, 3, 336, 336)
+    with torch.no_grad():
+        out_custom = model._forward_backbone(x)
+        out_timm = model.backbone(x)
+
+    assert torch.allclose(out_custom, out_timm, atol=1e-5)
+
+
+def test_stage2_grads_reach_top_blocks_only() -> None:
+    """CPU test verifying Stage 2 non-reentrant checkpointing allows gradients to reach blocks 10-11."""
+    from src.training.ddp import set_stage_trainable
+
+    model = DINOv2SlotHead(img_size=56, pretrained=False)
+    model.train()
+    set_stage_trainable(model, stage=2)
+
+    x = torch.randn(2, 6, 3, 56, 56)
+    mask = torch.ones(2, 6)
+    out = model(x, mask)
+    out.sum().backward()
+
+    # Early blocks must have None grad
+    assert all(p.grad is None for p in model.backbone.blocks[0].parameters())
+    # Unfrozen top blocks must have non-None gradients
+    assert all(p.grad is not None for p in model.backbone.blocks[11].parameters())
+
+
+@pytest.mark.skipif("RSNA_BACKBONE_PATH" not in os.environ, reason="Requires offline backbone checkpoint")
+def test_dinov2_slothead_336px_pretrained_resampling() -> None:
+    """Verify offline checkpoint loads with timm resampled pos_embed matching reference resampler."""
+    from timm.layers import resample_abs_pos_embed
+
+    weights_path = os.environ["RSNA_BACKBONE_PATH"]
+    model = DINOv2SlotHead(img_size=336, pretrained=False, weights_path=weights_path)
+    sd = torch.load(weights_path, map_location="cpu", weights_only=True)
+    if "model" in sd:
+        sd = sd["model"]
+    elif "state_dict" in sd:
+        sd = sd["state_dict"]
+    elif "model_state_dict" in sd:
+        sd = sd["model_state_dict"]
+
+    assert "pos_embed" in sd, f"Checkpoint has no pos_embed: keys {list(sd.keys())[:5]}"
+    ref = resample_abs_pos_embed(sd["pos_embed"], new_size=(24, 24), num_prefix_tokens=1)
+    assert torch.allclose(model.backbone.pos_embed, ref, atol=1e-4)
+
+
+def test_continuous_soft_supervision_loss_with_random_logits() -> None:
+    """Verify MaskedBCEWithLogitsLoss with random non-zero logits matches PyTorch manual reduction."""
+    torch.manual_seed(123)
+    gold_weight = 2.0
+    loss_fn = MaskedBCEWithLogitsLoss(gold_weight=gold_weight)
+
+    logits = torch.randn(2, 12)
+    targets = torch.tensor([
+        [0.63, 0.22, 0.10, 0.90, 0.45, 0.05, 0.80, 0.15, 0.50, 0.70, 0.30, 0.60],
+        [1.00, 0.00, 1.00, 0.00, 1.00, 0.00, 1.00, 0.00, 1.00, 0.00, 1.00, 0.00],
+    ], dtype=torch.float32)
+    is_gold = torch.tensor([0, 1], dtype=torch.long)
+
+    loss = loss_fn(logits, targets, is_gold)
+    assert math.isfinite(loss.item())
+
+    raw_bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    row_weights = torch.tensor([[1.0], [gold_weight]])
+    expected_loss = (raw_bce * row_weights).sum() / 24.0
+
+    assert torch.allclose(loss, expected_loss, atol=1e-5)
+
+
+def test_lr_for_schedule_boundary_values() -> None:
+    """Verify unified lr_for schedule boundary mathematical invariants for 14-epoch training."""
+    spe = 100
+    epochs = 14
+
+    # 1. Stage 1 end (epoch 2.0): Head warm-up reaches 5e-4, backbone is 0.0
+    lr_head_s1_end = lr_for("head", step=2 * spe, spe=spe, epochs=epochs)
+    assert abs(lr_head_s1_end - 5e-4) < 1e-6
+    assert lr_for("bb_top2", step=2 * spe - 1, spe=spe, epochs=epochs) == 0.0
+
+    # 2. Stage 3 (epoch 5.5): bb_top2 is exactly 1.5e-5, head is 2e-4
+    lr_top2_s3 = lr_for("bb_top2", step=int(5.5 * spe), spe=spe, epochs=epochs)
+    lr_head_s3 = lr_for("head", step=int(5.5 * spe), spe=spe, epochs=epochs)
+    assert abs(lr_top2_s3 - 1.5e-5) < 1e-6
+    assert abs(lr_head_s3 - 2e-4) < 1e-6
+
+    # 3. Stage 4 final step: All learning rates anneal cleanly to ~0.0
+    final_step = 14 * spe
+    for fam in ("head", "bb_top2", "bb_top1", "bb_mid", "bb_bot"):
+        lr_final = lr_for(fam, step=final_step, spe=spe, epochs=epochs)
+        assert lr_final < 1e-6, f"{fam} did not anneal to 0: {lr_final}"
+
+
+def test_14_epoch_schedule_stage_mapping() -> None:
+    """Verify stage_for_epoch and stage4_start_for accurately reflect the 14-epoch schedule."""
+    assert stage_for_epoch(1, 14) == 1
+    assert stage_for_epoch(2, 14) == 1
+    assert stage_for_epoch(3, 14) == 2
+    assert stage_for_epoch(4, 14) == 2
+    assert stage_for_epoch(5, 14) == 3
+    assert stage_for_epoch(6, 14) == 3
+    assert stage_for_epoch(7, 14) == 3
+    for ep in range(8, 15):
+        assert stage_for_epoch(ep, 14) == 4
+    assert stage4_start_for(14) == 8
+
+
+def test_crop_and_resize_tight_fov_padding() -> None:
+    """Verify that a non-square 100mm x 128mm FOV image is symmetrically padded to square before resizing, preserving physical scale."""
+    from src.datasets.efficiency_pipeline import crop_and_resize_140mm
+
+    # 250 x 320 array with 0.4 mm spacing -> 100 mm x 128 mm FOV
+    vol = np.zeros((5, 250, 320), dtype=np.float32)
+    # 20 mm square feature at 0.4 mm spacing: 50 x 50 pixels centered
+    vol[:, 100:150, 135:185] = 2.0
+
+    out, info = crop_and_resize_140mm(vol, pixel_spacing=(0.4, 0.4), target_size=336, crop_mm=140.0)
+    assert out.shape == (5, 336, 336)
+    assert info["clipped"]
+
+    # In 140 mm crop resized to 336 px, 20 mm feature must span:
+    # 20 / 140 * 336 = 48.0 pixels across center row
+    feature_span_x = int((out[0, 168] > 1.0).sum())
+    assert abs(feature_span_x - 48) <= 2, f"Expected ~48 px span, got {feature_span_x}"
+
+
+def test_efficiency_dataset_npz_loading(tmp_path: Path) -> None:
+    """Verify EfficiencyStudyDataset seamlessly loads compressed .npz archives."""
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    uid = "test_npz_study"
+
+    img_data = np.random.randn(6, 5, 336, 336).astype(np.float16)
+    mask_data = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    with open(cache_dir / f"{uid}.npz", "wb") as f:
+        np.savez_compressed(f, image=img_data, presence_mask=mask_data, clipped=np.uint8(0))
+
+    ds = EfficiencyStudyDataset(
+        study_uids=[uid],
+        study_dirs=[tmp_path],
+        labels=np.zeros((1, 12), dtype=np.float32),
+        is_gold=np.zeros(1, dtype=np.int64),
+        cached_tensor_dir=cache_dir,
+        target_size=336,
+        is_train=False,
+        require_cache=True,
+    )
+
+    item = ds[0]
+    assert item["study_id"] == uid
+    assert item["image"].shape == (6, 3, 336, 336)
+    assert item["presence_mask"].shape == (6,)
+    assert torch.allclose(item["presence_mask"], torch.from_numpy(mask_data))
+
+
+def test_verify_cache_manifest_and_files(tmp_path: Path) -> None:
+    """Verify verify_cache validates manifest metadata and reports missing files."""
+    from src.datasets.efficiency_pipeline import verify_cache
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    manifest = {
+        "target_size": 336,
+        "crop_mm": 140.0,
+        "n_slices_cached": 5,
+        "format": "npz",
+        "in_progress": False,
+        "failed_uids": [],
+    }
+    with open(cache_dir / "cache_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+
+    (cache_dir / "study_001.npz").touch()
+    with pytest.raises(RuntimeError, match="study_002"):
+        verify_cache(cache_dir, ["study_001", "study_002"], target_size=336, crop_mm=140.0)
+
+    # In-progress check
+    manifest["in_progress"] = True
+    with open(cache_dir / "cache_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        verify_cache(cache_dir, ["study_001"], target_size=336, crop_mm=140.0)
+
+    # Size mismatch check
+    manifest["in_progress"] = False
+    manifest["target_size"] = 224
+    with open(cache_dir / "cache_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
+    with pytest.raises(RuntimeError, match="provenance mismatch"):
+        verify_cache(cache_dir, ["study_001"], target_size=336, crop_mm=140.0)

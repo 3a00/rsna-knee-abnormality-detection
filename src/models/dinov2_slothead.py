@@ -13,6 +13,7 @@ import os
 import timm
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 
 class DINOv2SlotHead(nn.Module):
@@ -47,6 +48,7 @@ class DINOv2SlotHead(nn.Module):
         attn_dropout_p: float = 0.2,
         pre_cls_dropout_p: float = 0.3,
         init_bias_priors: list[float] | torch.Tensor | None = None,
+        use_grad_checkpointing: bool = True,
     ) -> None:
         """Initializes the DINOv2SlotHead model.
 
@@ -62,6 +64,7 @@ class DINOv2SlotHead(nn.Module):
             attn_dropout_p: Cross-attention dropout probability (default: 0.2).
             pre_cls_dropout_p: Pre-classifier dropout probability (default: 0.3).
             init_bias_priors: Empirical positive label priors for zero-step BCE log-odds bias initialization.
+            use_grad_checkpointing: Whether to enable non-reentrant gradient checkpointing through blocks.
         """
         super().__init__()
         self.embed_dim = embed_dim
@@ -72,6 +75,7 @@ class DINOv2SlotHead(nn.Module):
         self.slot_dropout_p = slot_dropout_p
         self.attn_dropout_p = attn_dropout_p
         self.pre_cls_dropout_p = pre_cls_dropout_p
+        self.use_grad_checkpointing = use_grad_checkpointing
 
         # Backbone: DINOv2-Small patch14 (consistent .lvd142m tag)
         if weights_path is not None:
@@ -90,6 +94,14 @@ class DINOv2SlotHead(nn.Module):
                 pretrained=pretrained,
                 num_classes=0,
                 img_size=img_size,
+            )
+
+        # Verify positional embedding tokens contract; raise ValueError (immune to python -O)
+        expected_tokens = 1 + (img_size // 14) ** 2
+        if self.backbone.pos_embed.shape[1] != expected_tokens:
+            raise ValueError(
+                f"Expected {expected_tokens} pos_embed tokens for img_size={img_size}, "
+                f"got {self.backbone.pos_embed.shape[1]}"
             )
 
         # Slot identity embeddings: E_slot in R^(6 x D)
@@ -141,6 +153,27 @@ class DINOv2SlotHead(nn.Module):
         # Guarantee at least one slot remains active per study if originally present
         return torch.where(dropped.any(dim=-1, keepdim=True), dropped, present)
 
+    def _forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward ViT backbone with non-reentrant gradient checkpointing.
+
+        Uses non-reentrant checkpointing during training so downstream unfrozen blocks
+        receive valid gradients even when inputs originate from frozen blocks.
+        Delegates directly to self.backbone(x) when checkpointing is not active.
+        """
+        ckpt = self.use_grad_checkpointing and self.training and torch.is_grad_enabled()
+        if not ckpt:
+            return self.backbone(x)
+
+        bb = self.backbone
+        x = bb.patch_embed(x)
+        x = bb._pos_embed(x)
+        x = bb.patch_drop(x)
+        x = bb.norm_pre(x)
+        for blk in bb.blocks:
+            x = checkpoint(blk, x, use_reentrant=False)
+        x = bb.norm(x)
+        return x[:, 0]  # CLS token representation (D=384)
+
     def _forward_backbone_and_head(
         self,
         x: torch.Tensor,
@@ -157,11 +190,11 @@ class DINOv2SlotHead(nn.Module):
         # Step 1: Gather and forward ONLY present slots through the ViT backbone
         feats = x.new_zeros(b, s, self.embed_dim, dtype=torch.float32)
         if present.any():
-            feats[present] = self.backbone(x[present]).float()
+            feats[present] = self._forward_backbone(x[present]).float()
         else:
             # DDP parameter synchronization guard: if entire batch is absent,
             # run a dummy slice through backbone so parameters always receive gradients
-            dummy = self.backbone(x.new_zeros(1, c, h, w)).float()
+            dummy = self._forward_backbone(x.new_zeros(1, c, h, w)).float()
             feats = feats + 0.0 * dummy.sum()
 
         # Step 2: Unconditional FP32 SlotHead Execution (branch-free, zero GPU sync)

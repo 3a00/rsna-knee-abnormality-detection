@@ -12,6 +12,7 @@ Only 18 DICOM pixel arrays are decoded per study.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import re
 import warnings
 from dataclasses import dataclass
@@ -316,17 +317,60 @@ def route_series_to_slot(plane: str, is_fluid: bool, is_fs: bool) -> Optional[in
     return None
 
 
+def corner_patches(arr: np.ndarray, patch_size: int = 16) -> list[np.ndarray]:
+    """Extract 4 corner patches from 2D or 3D slice array."""
+    h, w = arr.shape[-2:]
+    ps = min(patch_size, h // 2, w // 2)
+    return [
+        arr[..., :ps, :ps],
+        arr[..., :ps, -ps:],
+        arr[..., -ps:, :ps],
+        arr[..., -ps:, -ps:],
+    ]
+
+
+class CropMask(np.ndarray):
+    """Boolean mask of valid unpadded FOV pixels that also exposes crop info metadata."""
+
+    clipped: bool
+
+    def __new__(cls, input_array: np.ndarray, clipped: bool = False) -> "CropMask":
+        obj = np.asarray(input_array).view(cls)
+        obj.clipped = clipped
+        return obj
+
+    def __array_finalize__(self, obj: Any) -> None:
+        if obj is None:
+            return
+        self.clipped = getattr(obj, "clipped", False)
+
+    def __getitem__(self, item: Any) -> Any:
+        if isinstance(item, str):
+            if item == "clipped":
+                return self.clipped
+            raise KeyError(item)
+        return super().__getitem__(item)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "clipped":
+            return self.clipped
+        return default
+
+    def __contains__(self, key: object) -> bool:
+        if key == "clipped":
+            return True
+        return super().__contains__(key)
+
+
 def crop_and_resize_140mm(
     img_volume: np.ndarray,
     pixel_spacing: tuple[float, float],
     target_size: int = 336,
     crop_mm: float = DEFAULT_CROP_MM,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, CropMask]:
     """Extract square 140 mm physical FOV centered on image array and resize to target_size x target_size for K slices.
-    
-    Returns:
-        tuple of (cropped_volume, unpadded_valid_mask)
-        unpadded_valid_mask is strictly resized to (target_size, target_size) boolean.
+
+    Pads before normalization using the corner median to prevent artificial high-contrast borders.
     """
     k_slices, h, w = img_volume.shape
     psy = max(float(pixel_spacing[0]), 1e-3)
@@ -337,10 +381,13 @@ def crop_and_resize_140mm(
 
     pad_y = max(0, req_h - h)
     pad_x = max(0, req_w - w)
+    clipped = bool(pad_y > 0 or pad_x > 0)
 
     valid_mask = np.ones((h, w), dtype=bool)
 
-    if pad_y > 0 or pad_x > 0:
+    if clipped:
+        corners = corner_patches(img_volume, 16)
+        fill = float(np.median(np.concatenate([c.ravel() for c in corners])))
         pad_top = pad_y // 2
         pad_bot = pad_y - pad_top
         pad_left = pad_x // 2
@@ -349,7 +396,7 @@ def crop_and_resize_140mm(
             img_volume,
             ((0, 0), (pad_top, pad_bot), (pad_left, pad_right)),
             mode="constant",
-            constant_values=0.0,
+            constant_values=fill,
         )
         valid_mask = np.pad(
             valid_mask,
@@ -375,7 +422,7 @@ def crop_and_resize_140mm(
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
 
-    return out, out_mask
+    return out, CropMask(out_mask, clipped=clipped)
 
 
 def normalize_volume_dinov2(
@@ -563,21 +610,19 @@ def process_study_to_5slice_cache(
     target_size: int = 336,
     crop_mm: float = DEFAULT_CROP_MM,
     slice_pos: float = 0.5,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Process all series in a study directory into 5-slice cached tensor and mask.
-
-    Returns:
-        study_tensor: torch.Tensor of shape (6, 5, target_size, target_size) in float16.
-        presence_mask: torch.Tensor of shape (6,) in float32.
-    """
+    return_info: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Process all series in a study directory into 5-slice cached tensor and mask."""
     study_path = Path(study_dir)
     dcm_files = [str(f) for f in sorted(study_path.rglob("*")) if f.is_file() and not f.name.startswith(".")]
 
     study_tensor = np.zeros((NUM_SLOTS, 5, target_size, target_size), dtype=np.float32)
     presence_mask = np.zeros(NUM_SLOTS, dtype=np.float32)
+    is_study_clipped = False
 
     if not dcm_files:
-        return torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+        t_res, m_res = torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+        return (t_res, m_res, {"clipped": False, "active_slots": []}) if return_info else (t_res, m_res)
 
     headers: list[DICOMHeaderMeta] = []
     if num_workers > 0:
@@ -593,14 +638,14 @@ def process_study_to_5slice_cache(
                 headers.append(meta)
 
     if not headers:
-        return torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+        t_res, m_res = torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+        return (t_res, m_res, {"clipped": False, "active_slots": []}) if return_info else (t_res, m_res)
 
     series_groups: dict[str, list[DICOMHeaderMeta]] = {}
     for h in headers:
         series_groups.setdefault(h.series_uid, []).append(h)
 
     slot_cands: dict[int, list[tuple[tuple[int, int, int], str, list[DICOMHeaderMeta]]]] = {}
-
     for s_uid in sorted(series_groups.keys()):
         s_headers = series_groups[s_uid]
         sample = s_headers[0]
@@ -622,6 +667,7 @@ def process_study_to_5slice_cache(
             score = (-fs_pri, -is_2d, -unique_k_cnt)
             slot_cands.setdefault(slot, []).append((score, s_uid, s_headers))
 
+    active_slots = []
     for slot_idx, cands in slot_cands.items():
         cands.sort(key=lambda c: (c[0], c[1]))
         for _, uid, s_headers in cands:
@@ -633,25 +679,31 @@ def process_study_to_5slice_cache(
                 if raw_vol is None:
                     continue
 
-                cropped_vol, valid_mask = crop_and_resize_140mm(
+                cropped_vol, crop_info = crop_and_resize_140mm(
                     raw_vol,
                     pixel_spacing=s_headers[0].pixel_spacing,
                     target_size=target_size,
                     crop_mm=crop_mm,
                 )
-                normed_vol, is_valid = normalize_volume_dinov2(cropped_vol, valid_mask=valid_mask)
+                if crop_info["clipped"]:
+                    is_study_clipped = True
+
+                normed_vol, is_valid = normalize_volume_dinov2(cropped_vol)
                 if not is_valid:
                     continue
 
                 study_tensor[slot_idx] = normed_vol
                 presence_mask[slot_idx] = 1.0
+                active_slots.append(slot_idx)
                 break
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning("Error processing series %s in study %s: %s", uid, study_path.name, e)
+            except Exception:
                 continue
 
-    return torch.from_numpy(study_tensor).half(), torch.from_numpy(presence_mask)
+    t_res = torch.from_numpy(study_tensor).half()
+    m_res = torch.from_numpy(presence_mask)
+    if return_info:
+        return t_res, m_res, {"clipped": is_study_clipped, "active_slots": active_slots}
+    return t_res, m_res
 
 
 def process_study_to_6slot(
@@ -766,13 +818,13 @@ def process_study_to_6slot(
                     stats["decode_errors"] += 1
                     continue
 
-                cropped_triplet, valid_mask = crop_and_resize_140mm(
+                cropped_triplet, _ = crop_and_resize_140mm(
                     raw_triplet,
                     pixel_spacing=s_headers[0].pixel_spacing,
                     target_size=target_size,
                     crop_mm=crop_mm,
                 )
-                normed_triplet, is_valid = normalize_triplet_dinov2(cropped_triplet, valid_mask=valid_mask)
+                normed_triplet, is_valid = normalize_triplet_dinov2(cropped_triplet)
                 if not is_valid:
                     stats["constant_volumes"] += 1
                     continue
@@ -833,3 +885,60 @@ class Fast6SlotDICOMDataset(Dataset):
         if self.labels is not None:
             item["labels"] = torch.from_numpy(self.labels[idx])
         return item
+
+
+def verify_cache(
+    cache_dir: str | Path,
+    uids: Sequence[str],
+    target_size: int = 336,
+    crop_mm: float = DEFAULT_CROP_MM,
+    max_fail_frac: float = 0.005,
+) -> tuple[list[str], list[str]]:
+    """Verify cache manifest provenance and confirm all studies exist as .npz or .pt archives.
+
+    Args:
+        cache_dir: Directory containing cached study archives and manifest.
+        uids: Sequence of StudyInstanceUID strings expected to be present.
+        target_size: Expected spatial resolution in pixels (default: 336).
+        crop_mm: Expected physical field of view in millimeters (default: 140.0).
+        max_fail_frac: Maximum allowed fraction of failed studies before erroring (default: 0.005).
+
+    Returns:
+        Tuple of (valid_uids, empty_uids).
+
+    Raises:
+        FileNotFoundError: If cache_manifest.json is not found.
+        RuntimeError: If cache is marked in-progress, provenance mismatches, failure threshold
+            is exceeded, or any valid studies are missing archive files.
+    """
+    d = Path(cache_dir)
+    manifest_p = d / "cache_manifest.json"
+    if not manifest_p.is_file():
+        raise FileNotFoundError(f"Missing cache manifest at {manifest_p}. Run preprocess_336px_cache.py first.")
+
+    with open(manifest_p, "r", encoding="utf-8") as f:
+        m = json.load(f)
+
+    if m.get("in_progress", False):
+        raise RuntimeError(f"Cache build at {d} is incomplete (in_progress=True). Re-run preprocess script.")
+
+    if (
+        int(m.get("target_size", 0)) != target_size
+        or abs(float(m.get("crop_mm", 0.0)) - crop_mm) > 1e-4
+        or m.get("format", "pt") not in ("npz", "pt")
+    ):
+        raise RuntimeError(f"Cache provenance mismatch in {manifest_p}: {m}")
+
+    failed_set = set(m.get("failed_uids", []))
+    empty_uids = list(m.get("empty_uids", []))
+    max_allowed_failures = max(1, int(max_fail_frac * len(uids)))
+    if len(failed_set) > max_allowed_failures:
+        raise RuntimeError(f"Cache failure rate ({len(failed_set)}) exceeds threshold ({max_allowed_failures})")
+
+    valid_uids = [u for u in uids if u not in failed_set]
+    missing = [u for u in valid_uids if not ((d / f"{u}.npz").is_file() or (d / f"{u}.pt").is_file())]
+    if missing:
+        raise RuntimeError(f"{len(missing)} studies missing from cache: e.g. {missing[:5]}")
+
+    return valid_uids, empty_uids
+

@@ -38,8 +38,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from src.datasets.efficiency_pipeline import DEFAULT_CROP_MM
+from src.datasets.efficiency_pipeline import DEFAULT_CROP_MM, verify_cache
 from src.models.dinov2_slothead import DINOv2SlotHead
+from src.training.ddp import advance_stage, rewrap_ddp, set_stage_trainable
+apply_unfreezing_stage = set_stage_trainable
 from src.training.losses import MaskedBCEWithLogitsLoss
 from src.training.metrics import compute_competition_metrics, load_label_columns
 from src.training.train_efficiency import (
@@ -63,135 +65,39 @@ def lr_for(family: str, step: int, spe: int, epochs: int) -> float:
     """Compute explicit learning rate for parameter family at the given training step.
 
     Applies a 100-step linear warmup ramp strictly to newly unfrozen layers at each stage boundary.
-    Already-unfrozen layers transition cleanly without downward plunges.
+    Parameterizes stage boundaries to eliminate duplicate code across 14-epoch and 10-epoch runs.
     """
+    e1, e2, e3 = (2, 4, 7) if epochs >= 14 else (2, 4, 6)
     ep = step / max(1, spe)
+    ramp = lambda start: min(1.0, max(0.05, float(step - start * spe) / 100.0))
 
-    if ep < 2.0:
-        # Stage 1: Head warmup & decay, backbone frozen
+    if ep < e1:
         if family != "head":
             return 0.0
         return (1e-4 + 9e-4 * ep) if ep < 1.0 else (1e-3 - 5e-4 * (ep - 1.0))
 
-    if ep < 4.0:
-        # Stage 2: Top-2 blocks + Head
-        p = (ep - 2.0) / 2.0
+    if ep < e2:
         if family == "head":
-            return 5e-4 - 2e-4 * p
-        if family == "bb_top2":
-            step_in_stage2 = step - 2 * spe
-            ramp = min(1.0, max(0.05, float(step_in_stage2) / 100.0))
-            return 1e-5 * ramp
-        return 0.0
+            return 5e-4 - 2e-4 * (ep - e1) / float(e2 - e1)
+        return 1e-5 * ramp(e1) if family == "bb_top2" else 0.0
 
-    if ep < 6.0:
-        # Stage 3: Top-4 blocks + Head
+    if ep < e3:
         if family == "head":
             return 2e-4
         if family == "bb_top2":
             return 1.5e-5
-        if family == "bb_top1":
-            step_in_stage3 = step - 4 * spe
-            ramp = min(1.0, max(0.05, float(step_in_stage3) / 100.0))
-            return 1e-5 * ramp
-        return 0.0
+        return 1e-5 * ramp(e2) if family == "bb_top1" else 0.0
 
-    # Stage 4: All blocks unfrozen, cosine decay to zero
-    ep4 = ep - 6.0
-    p = min(1.0, ep4 / max(1.0, float(epochs - 6)))
+    # Stage 4: Cosine decay across remaining epochs
+    p = min(1.0, (ep - e3) / max(1.0, float(epochs - e3)))
     peak = STAGE4_LR_PEAKS.get(family, 2e-4)
     base = peak * 0.5 * (1.0 + math.cos(math.pi * p))
-
-    step_in_stage4 = step - 6 * spe
-    if family in ("bb_mid", "bb_bot") and step_in_stage4 < 100:
-        ramp = min(1.0, max(0.05, float(step_in_stage4) / 100.0))
-        return base * ramp
-    return base
-
-
-def apply_unfreezing_stage(raw_model: DINOv2SlotHead, stage: int) -> None:
-    """Set parameter requires_grad flags according to unfreezing stage."""
-    for p in raw_model.backbone.parameters():
-        p.requires_grad = False
-
-    if stage == 1:
-        pass
-    elif stage == 2:
-        for p in raw_model.backbone.blocks[10:].parameters():
-            p.requires_grad = True
-        for p in raw_model.backbone.norm.parameters():
-            p.requires_grad = True
-    elif stage == 3:
-        for p in raw_model.backbone.blocks[8:].parameters():
-            p.requires_grad = True
-        for p in raw_model.backbone.norm.parameters():
-            p.requires_grad = True
-    elif stage == 4:
-        for p in raw_model.backbone.parameters():
-            p.requires_grad = True
-    else:
-        raise ValueError(f"Unknown unfreezing stage: {stage}")
-
-
-def rewrap_ddp(
-    raw_model: DINOv2SlotHead,
-    device: torch.device,
-    local_rank: int,
-) -> DDP:
-    """Instantiate DDP wrapper with find_unused_parameters=False."""
-    if device.type == "cuda":
-        return DDP(
-            raw_model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-            find_unused_parameters=False,
-        )
-    return DDP(raw_model, find_unused_parameters=False)
+    return base * ramp(e3) if family in ("bb_mid", "bb_bot") else base
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
     """Unwrap DistributedDataParallel or DataParallel wrapper to access base module."""
     return model.module if isinstance(model, (DDP, nn.DataParallel)) else model
-
-
-def verify_cache(
-    cache_dir: str | Path,
-    uids: Sequence[str],
-    target_size: int = 336,
-    crop_mm: float = DEFAULT_CROP_MM,
-) -> tuple[list[str], list[str]]:
-    """Verify cache manifest provenance and check coverage before spawning DDP."""
-    d = Path(cache_dir)
-    manifest_p = d / "cache_manifest.json"
-    if not manifest_p.is_file():
-        raise FileNotFoundError(f"Missing cache manifest at {manifest_p}. Run preprocess_volumes.py first.")
-
-    with open(manifest_p, "r", encoding="utf-8") as f:
-        m = json.load(f)
-
-    if (
-        m.get("n_slices_cached") != 5
-        or m.get("target_size") != target_size
-        or abs(float(m.get("crop_mm", 0.0)) - crop_mm) > 1e-4
-    ):
-        raise RuntimeError(f"Cache provenance mismatch: {m}")
-
-    if m.get("in_progress", False):
-        raise RuntimeError(f"Cache build at {d} is incomplete or was interrupted (in_progress=True). Re-run preprocess_volumes.py.")
-
-    failed_set = set(m.get("failed_uids", []))
-    empty_uids = list(m.get("empty_uids", []))
-    max_allowed_failures = max(1, int(0.005 * len(uids)))
-    if len(failed_set) > max_allowed_failures:
-        raise RuntimeError(f"Cache failure rate ({len(failed_set)}) exceeds allowed 0.5% threshold ({max_allowed_failures})")
-
-    valid_uids = [u for u in uids if u not in failed_set]
-    missing = [u for u in valid_uids if not (d / f"{u}.pt").is_file()]
-    if missing:
-        raise RuntimeError(f"{len(missing)} studies missing from cache: e.g. {missing[:3]}")
-
-    logger.info("Cache verification passed: %d valid studies (excluded %d failures, %d empty)", len(valid_uids), len(failed_set), len(empty_uids))
-    return valid_uids, empty_uids
 
 
 def gather_unique_records(
@@ -233,8 +139,12 @@ def evaluate_dataset_collective(
     is_rank0: bool,
     use_amp: bool = True,
     criterion: nn.Module | None = None,
-) -> tuple[float, float, float, list[dict[str, Any]]]:
-    """Run rank-sharded validation and compute macro AUC & true GPU-safe BCE loss on rank 0."""
+) -> tuple[float, float, float, int, float, list[dict[str, Any]]]:
+    """Run rank-sharded validation and compute macro AUC & true GPU-safe BCE loss on rank 0.
+
+    Returns:
+        tuple of (score_11, score_12, score_gold, gold_n_labels, val_loss, all_val_records)
+    """
     ddp_model.eval()
     local_records = []
     with torch.no_grad():
@@ -254,7 +164,7 @@ def evaluate_dataset_collective(
 
     all_val_records = gather_unique_records(local_records, world_size)
 
-    score_11, score_12, val_loss = 0.0, 0.0, 0.0
+    score_11, score_12, score_gold, gold_n_labels, val_loss = 0.0, 0.0, float("nan"), 0, 0.0
     if is_rank0:
         val_logits_np = np.array([r["logits"] for r in all_val_records])
         val_targets_np = np.array([r["targets"] for r in all_val_records])
@@ -269,6 +179,23 @@ def evaluate_dataset_collective(
         score_11 = metrics.macro_auc_11
         score_12 = metrics.macro_auc_12
 
+        # Evaluate Gold subset AUC cleanly without false 0.0 logging
+        gold_mask_arr = (val_is_gold_np == 1)
+        if gold_mask_arr.any():
+            try:
+                gold_metrics = compute_competition_metrics(
+                    logits=val_logits_np[gold_mask_arr],
+                    targets=val_targets_np[gold_mask_arr],
+                    gold_mask=np.ones(gold_mask_arr.sum(), dtype=np.int64),
+                    label_cols=label_cols,
+                )
+                score_gold = gold_metrics.macro_auc_11
+                gold_n_labels = gold_metrics.n_valid_labels
+            except Exception as e:
+                logger.warning("Gold subset AUC undefined: %s", e)
+                score_gold = float("nan")
+                gold_n_labels = 0
+
         val_loss = compute_collective_val_loss(
             val_logits_np=val_logits_np,
             val_targets_np=val_targets_np,
@@ -277,7 +204,7 @@ def evaluate_dataset_collective(
             device=device,
         )
 
-    return score_11, score_12, val_loss, all_val_records
+    return score_11, score_12, score_gold, gold_n_labels, val_loss, all_val_records
 
 
 def train_ddp_worker(
@@ -343,6 +270,15 @@ def train_ddp_worker(
     else:
         if is_rank0:
             logger.info("Soft weak supervision disabled (--no-soft-synovitis): silent rows left as NaN")
+
+    # 2d. Soft-label premise preflight check
+    labels_mat = train_df[label_cols].values
+    frac_counts = ((labels_mat > 0) & (labels_mat < 1)).sum(axis=0)
+    frac_series = pd.Series(frac_counts, index=label_cols)
+    if is_rank0:
+        logger.info("Fractional soft targets count per label:\n%s", frac_series)
+    if args.soft_synovitis and frac_counts.sum() == 0:
+        raise ValueError("Labels file has no fractional targets; soft supervision would be a no-op.")
 
     def _resolve_study_dirs(df_uids: Sequence[Any]) -> list[Path]:
         if args.dicom_root:
@@ -418,23 +354,21 @@ def train_ddp_worker(
     stage4_start = stage4_start_for(args.epochs)
 
     for epoch in range(1, args.epochs + 1):
-        stage = stage_for_epoch(epoch)
+        stage = stage_for_epoch(epoch, total_epochs=args.epochs)
 
         if stage != current_stage:
             current_stage = stage
-            apply_unfreezing_stage(raw_model, stage)
-
-            ref = weakref.ref(ddp_model) if ddp_model is not None else None
+            # Drop previous reference before advancing stage
             ddp_model = None
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-            if ref is not None and ref() is not None:
-                logger.warning("Stale DDP wrapper reference still lingering!")
-            if dist.is_initialized():
-                dist.barrier()
 
-            ddp_model = rewrap_ddp(raw_model, device, local_rank)
+            ddp_model = advance_stage(
+                raw_model=raw_model,
+                stage=stage,
+                local_rank=local_rank,
+            )
             if is_rank0:
                 logger.info("Transitioned to Stage %d at Epoch %d", stage, epoch)
 
@@ -481,7 +415,7 @@ def train_ddp_worker(
         logits = loss = raw_loss = None
 
         try:
-            score_11, score_12, val_loss, _ = evaluate_dataset_collective(
+            score_11, score_12, score_gold, gold_n_labels, val_loss, _ = evaluate_dataset_collective(
                 ddp_model=ddp_model,
                 val_loader=val_loader,
                 device=device,
@@ -498,12 +432,15 @@ def train_ddp_worker(
 
         if is_rank0:
             avg_train_loss = epoch_loss_sum / max(1, step_count)
-            logger.info("Epoch %d Val Macro AUC 11: %.4f (AUC 12: %.4f, Val Loss: %.4f, Train Loss: %.4f)",
-                        epoch, score_11, score_12, val_loss, avg_train_loss)
+            logger.info("Epoch %d Val Macro AUC 11: %.4f (AUC 12: %.4f, Gold: %.4f [%d labels], Val Loss: %.4f, Train Loss: %.4f)",
+                        epoch, score_11, score_12, score_gold, gold_n_labels, val_loss, avg_train_loss)
             tb_logger.log_scalar("val/macro_auc_11", score_11, epoch)
             tb_logger.log_scalar("val/macro_auc_12", score_12, epoch)
             tb_logger.log_scalar("val/loss", val_loss, epoch)
             tb_logger.log_scalar("train/loss", avg_train_loss, epoch)
+            if not math.isnan(score_gold):
+                tb_logger.log_scalar("val/macro_auc_gold", score_gold, epoch)
+                tb_logger.log_scalar("val/gold_n_labels", gold_n_labels, epoch)
 
             history.append({
                 "epoch": epoch,
@@ -511,6 +448,7 @@ def train_ddp_worker(
                 "val_loss": float(val_loss),
                 "macro_auc_11": float(score_11),
                 "macro_auc_12": float(score_12),
+                "macro_auc_gold": float(score_gold) if not math.isnan(score_gold) else None,
                 "score": float(score_11),
             })
 
@@ -551,7 +489,7 @@ def train_ddp_worker(
     recommended_path = best_single_path if best_single_path.is_file() else None
     if avg_flag[0]:
         raw_model.load_state_dict(torch.load(top3_path, map_location=device))
-        ens_score, _, _, _ = evaluate_dataset_collective(
+        ens_score, _, _, _, _, _ = evaluate_dataset_collective(
             ddp_model=ddp_model,
             val_loader=val_loader,
             device=device,
@@ -591,18 +529,18 @@ def train_ddp_worker(
 def main() -> None:
     parser = argparse.ArgumentParser(description="DDP Training Runner for RSNA Efficiency Track")
     parser.add_argument("--fold", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=14)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--img-size", type=int, default=336)
     parser.add_argument("--crop-mm", type=float, default=DEFAULT_CROP_MM)
     parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--gold-weight", type=float, default=5.0)
+    parser.add_argument("--gold-weight", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-cache", action="store_true", default=False)
-    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache")
+    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache_336_140mm")
     parser.add_argument("--weights-path", type=str, default=None)
     parser.add_argument("--allow-random-init", action="store_true", default=False)
     parser.add_argument("--slot-dropout-p", type=float, default=0.0)
@@ -641,6 +579,7 @@ def main() -> None:
         valid_uids, empty_uids = verify_cache(args.cache_dir, uids, target_size=args.img_size, crop_mm=args.crop_mm)
         args.valid_uids = frozenset(valid_uids)
         args.empty_uids = frozenset(empty_uids)
+        logger.info("Preflight cache verification passed for %d studies", len(valid_uids))
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")

@@ -38,8 +38,8 @@ class MaskedBCEWithLogitsLoss(nn.Module):
     higher loss contribution to compensate for their 1.3% share in the dataset.
 
     Args:
-        gold_weight: Loss multiplier for gold studies (default: 5.0).
-                     Effectively brings gold studies to ~6.2% of gradient signal.
+        gold_weight: Loss multiplier for gold studies (default: 2.0 per Ticket 10).
+                     Balances gold ground-truth fidelity against whole-cohort continuous weak supervision.
         pos_weight: Per-label positive class weight tensor (12,) for
                     class imbalance correction (optional).
         reduction: 'mean' (default) or 'sum'.
@@ -47,7 +47,7 @@ class MaskedBCEWithLogitsLoss(nn.Module):
 
     def __init__(
         self,
-        gold_weight: float = 5.0,
+        gold_weight: float = 2.0,
         pos_weight: torch.Tensor | None = None,
         reduction: str = "mean",
         continuous_pos_weight: bool = True,
