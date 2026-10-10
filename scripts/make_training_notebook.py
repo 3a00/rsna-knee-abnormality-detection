@@ -164,7 +164,7 @@ notebook = {
             "metadata": {},
             "source": [
                 "## Cell 4: One-Time 5-Slice Volume Pre-Caching (~18–24 min)\n",
-                "Pre-extracts 5 centered physical slices per present slot into session scratch (`/kaggle/tmp/rsna_cache`).\n",
+                "Pre-extracts 5 centered physical slices per present slot into session scratch (`/kaggle/tmp/rsna_cache_336_140mm`).\n",
                 "Completely eliminates network-disk I/O bottlenecks during distributed training."
             ]
         },
@@ -186,28 +186,30 @@ notebook = {
                 "print(f'DICOM root: {dicom_root}')\n",
                 "assert train_series_csv.is_file(), f'Missing train_series.csv at {train_series_csv}'\n",
                 "\n",
-                "cache_dir = Path('/kaggle/tmp/rsna_cache')\n",
+                "cache_dir = Path('/kaggle/tmp/rsna_cache_336_140mm')\n",
                 "cache_dir.mkdir(parents=True, exist_ok=True)\n",
                 "\n",
                 "# Run 5-slice volume pre-caching\n",
                 "preprocess_cmd = [\n",
-                "    sys.executable, 'scripts/preprocess_volumes.py',\n",
+                "    sys.executable, 'scripts/preprocess_336px_cache.py',\n",
                 "    '--dicom-root', str(dicom_root),\n",
                 "    '--cache-dir', str(cache_dir),\n",
                 "    '--series-csv', str(train_series_csv),\n",
                 "    '--splits-csv', '/kaggle/working/data/splits/cv_folds_3fold.csv',\n",
+                "    '--target-size', '336',\n",
+                "    '--crop-mm', '140.0',\n",
                 "    '--num-workers', '4',\n",
                 "]\n",
-                "print(f'Executing pre-caching: {\" \".join(preprocess_cmd)}')\n",
+                "print(f'Executing 336px pre-caching: {\" \".join(preprocess_cmd)}')\n",
                 "subprocess.run(preprocess_cmd, check=True)\n"
             ]
         },
-        # Cell 5: Dual-T4 DistributedDataParallel Full Training (10 Epochs)
+        # Cell 5: Dual-T4 DistributedDataParallel Full Training (14 Epochs, Batch Size 8 per GPU)
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "## Cell 5: Dual-T4 DistributedDataParallel Full Training (10 Epochs)\n",
+                "## Cell 5: Dual-T4 DistributedDataParallel Full Training (14 Epochs, Batch Size 8 per GPU)\n",
                 "Trains DINOv2-Small SlotHead with dynamic depth jitter, symmetry-preserving augmentations, and 4-stage progressive unfreezing."
             ]
         },
@@ -220,12 +222,13 @@ notebook = {
                 "train_cmd = [\n",
                 "    sys.executable, 'scripts/train_ddp_efficiency.py',\n",
                 "    '--fold', '0',\n",
-                "    '--epochs', '10',\n",
-                "    '--batch-size', '4',\n",
+                "    '--epochs', '14',\n",
+                "    '--batch-size', '8',\n",
                 "    '--grad-accum-steps', '1',\n",
                 "    '--img-size', '336',\n",
+                "    '--crop-mm', '140.0',\n",
                 "    '--weight-decay', '0.05',\n",
-                "    '--gold-weight', '5.0',\n",
+                "    '--gold-weight', '2.0',\n",
                 "    '--cache-dir', str(cache_dir),\n",
                 "    '--require-cache',\n",
                 "    '--weights-path', str(BACKBONE_PATH),\n",

@@ -198,9 +198,16 @@ class EfficiencyStudyDataset(Dataset):
 
         # Fast-path: pre-extracted cached tensor
         if self.cached_dir is not None:
-            cache_file = self.cached_dir / f"{uid}.pt"
-            if cache_file.is_file():
-                cached = torch.load(cache_file, map_location="cpu", weights_only=True)
+            npz_file = self.cached_dir / f"{uid}.npz"
+            pt_file = self.cached_dir / f"{uid}.pt"
+
+            if npz_file.is_file():
+                with open(npz_file, "rb") as fp:
+                    data = np.load(fp)
+                    img = torch.from_numpy(data["image"])
+                    mask = torch.from_numpy(data["presence_mask"]).float()
+            elif pt_file.is_file():
+                cached = torch.load(pt_file, map_location="cpu", weights_only=True)
                 if isinstance(cached, dict):
                     meta = cached.get("meta")
                     if meta is not None:
@@ -208,22 +215,28 @@ class EfficiencyStudyDataset(Dataset):
                         cached_crop = float(meta.get("crop_mm", self.crop_mm))
                         if cached_sz != self.target_size or abs(cached_crop - self.crop_mm) > 1e-4:
                             raise RuntimeError(f"Stale cache for {uid}: cached {meta}")
-                    img = cached["image"]  # (6, S, 336, 336)
-                    mask = cached["presence_mask"]
+                    img = cached["image"]
+                    mask = cached["presence_mask"].float()
                 else:
-                    img, mask = cached[0], cached[1]
+                    img, mask = cached[0], cached[1].float()
+            elif self.require_cache:
+                raise FileNotFoundError(f"Missing cache file for study {uid} in {self.cached_dir}")
+            else:
+                img = mask = None
 
-                # Dynamic 2.5D Depth Jitter (guaranteeing contiguous layout)
+            if img is not None and mask is not None:
+                # Slice first, then convert to float to minimize memory copies
                 if img.shape[1] == 5:
                     if self.is_train:
-                        offset = random.randint(0, 2)  # Samples [0:3], [1:4], or [2:5]
-                        img = img[:, offset : offset + 3].contiguous()
+                        offset = random.randint(0, 2)
+                        img = img[:, offset : offset + 3].contiguous().float()
                     else:
-                        img = img[:, 1:4].contiguous()  # Deterministic center triplet
-                elif img.shape[1] != 3:
+                        img = img[:, 1:4].contiguous().float()
+                elif img.shape[1] == 3:
+                    img = img.contiguous().float()
+                else:
                     raise RuntimeError(f"Unexpected slice dimension: {img.shape[1]}")
 
-                # Symmetry-Preserving MSK Augmentations (training only)
                 if self.is_train:
                     img = apply_msk_augmentations(img, mask.float())
 
@@ -234,14 +247,8 @@ class EfficiencyStudyDataset(Dataset):
                 }
                 if self.labels is not None:
                     item["labels"] = torch.from_numpy(self.labels[idx])
-                if self.is_gold is not None:
-                    item["is_gold"] = torch.tensor(self.is_gold[idx], dtype=torch.long)
-                else:
-                    item["is_gold"] = torch.tensor(0, dtype=torch.long)
+                item["is_gold"] = torch.tensor(self.is_gold[idx] if self.is_gold is not None else 0, dtype=torch.long)
                 return item
-
-            elif self.require_cache:
-                raise FileNotFoundError(f"Missing required cache file for study {uid}: {cache_file}")
 
         # Normalization Parity Fallback: decode 5 slices with series_metadata and slice [1:4]
         study_dir = self.study_dirs[idx]
@@ -373,20 +380,21 @@ STAGE4_LR_PEAKS: dict[str, float] = {
 }
 
 
-def stage_for_epoch(epoch: int) -> int:
+def stage_for_epoch(epoch: int, total_epochs: int = 14) -> int:
     """Return progressive unfreezing stage (1..4) for given 1-indexed epoch."""
-    if epoch <= 2:
+    e1, e2, e3 = (2, 4, 7) if total_epochs >= 14 else (2, 4, 6)
+    if epoch <= e1:
         return 1
-    if epoch <= 4:
+    if epoch <= e2:
         return 2
-    if epoch <= 6:
+    if epoch <= e3:
         return 3
     return 4
 
 
 def stage4_start_for(epochs: int) -> int:
-    """Return first epoch eligible for Top-3 checkpoint averaging (debug fallback if epochs < 7)."""
-    return 7 if epochs >= 7 else 1
+    """Return first epoch eligible for Top-3 checkpoint averaging."""
+    return 8 if epochs >= 14 else (7 if epochs >= 7 else 1)
 
 
 def _param_family(name: str) -> str:
