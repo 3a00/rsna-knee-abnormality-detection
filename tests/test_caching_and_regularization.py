@@ -345,6 +345,29 @@ def test_soft_supervision_silent_only_routing() -> None:
     assert np.isnan(df.loc[3, "Synovitis"])     # Gold row NEVER modified
 
 
+def test_soft_supervision_pre_binarized_routing() -> None:
+    """Verify that impute_soft_synovitis works on pre-binarized CSV (e.g. pseudo_labels.csv)."""
+    df = pd.DataFrame({
+        "StudyInstanceUID": ["u1", "u2", "u3", "u4"],
+        "is_gold": [0, 0, 0, 1],
+        "Synovitis": [0.0, 1.0, 0.0, 0.0],
+        "synovitis_soft": [0.63, 1.0, 0.0, np.nan],
+    })
+    label_cols = ["Synovitis"]
+
+    n = impute_soft_synovitis(df, label_cols)
+    assert n == 1
+    assert df.loc[0, "Synovitis"] == 0.63       # Non-gold silent row (mapped to 0.0) receives soft label
+    assert df.loc[1, "Synovitis"] == 1.0        # Non-gold explicit positive PRESERVED
+    assert df.loc[2, "Synovitis"] == 0.0        # Non-gold explicit negative PRESERVED
+    assert df.loc[3, "Synovitis"] == 0.0        # Gold row NEVER modified
+
+    # Idempotent second invocation
+    n_second = impute_soft_synovitis(df, label_cols)
+    assert n_second == 1
+    assert df.loc[0, "Synovitis"] == 0.63
+
+
 def test_checkpoint_eligibility_stage4_restriction() -> None:
     """Verify stage4_start_for helper strictly enforces Stage 4 threshold."""
     assert stage4_start_for(10) == 7

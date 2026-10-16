@@ -134,3 +134,8 @@ _Avoid_: Main track 9-hour runtime, multi-hour unconstrained ensemble.
 A staged fine-tuning regimen transitioning from frozen feature extraction (head warmup), through top semantic transformer blocks, to full-depth differential learning rates to protect pretrained foundation representations from overfitting on small cohorts.
 _Avoid_: Instantaneous full-model unfreezing, static feature extraction.
 
+**Percentile Rank Averaging**:
+An ensembling strategy where predicted probabilities from each cross-validation fold or architecture are normalized to empirical percentile ranks in $[0, 1]$ before weighted combination, preventing sharp probability distributions from dominating smoother ones.
+_Avoid_: Direct uncalibrated probability addition, unweighted arithmetic mean of heterogeneous outputs.
+
+
