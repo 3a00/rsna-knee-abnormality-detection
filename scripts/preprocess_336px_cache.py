@@ -188,7 +188,7 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true", default=False)
     parser.add_argument("--qc-montage", type=str, default=None, help="Path for QC visual montage image (16-24 studies)")
     parser.add_argument("--benchmark", action="store_true", default=False)
-    parser.add_argument("--max-fail-frac", type=float, default=0.005, help="Allowed failure fraction (default: 0.5%)")
+    parser.add_argument("--max-fail-frac", type=float, default=0.005, help="Allowed failure fraction (default: 0.5%%)")
     args = parser.parse_args()
     seed_everything(42)
 

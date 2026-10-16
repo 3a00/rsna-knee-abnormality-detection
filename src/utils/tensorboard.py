@@ -100,12 +100,12 @@ def _safe_telemetry(func: Callable) -> Callable:
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
         if getattr(self, "writer", None) is None:
-            return None
+            return False if func.__name__ == "log_graph" else None
         try:
             return func(self, *args, **kwargs)
         except Exception as err:
             warnings.warn(f"Telemetry call {func.__name__} failed safely: {err}", stacklevel=2)
-            return None
+            return False if func.__name__ == "log_graph" else None
     return wrapper
 
 
@@ -141,8 +141,19 @@ class TelemetryLogger(Protocol):
         """Log complete epoch metrics, ROC-AUC, AP, and resource utilization."""
         ...
 
-    def log_graph(self, model: nn.Module, dummy_input: tuple[torch.Tensor, ...]) -> None:
-        """Log PyTorch model computational graph."""
+    def log_graph(self, model: nn.Module, dummy_input: tuple[torch.Tensor, ...]) -> bool:
+        """Log PyTorch model computational graph. Returns True on success."""
+        ...
+
+    def log_histograms(
+        self,
+        model: nn.Module,
+        step: int,
+        only_trainable: bool = True,
+        prefix: str = "",
+        bins: int = 64,
+    ) -> None:
+        """Log parameter weight and gradient distributions across training stages."""
         ...
 
     def log_attention_heatmap(
@@ -164,8 +175,9 @@ class TelemetryLogger(Protocol):
         step: int,
         gold_mask: np.ndarray | torch.Tensor | None = None,
         label_cols: Sequence[str] | None = None,
+        prefix: str = "",
     ) -> None:
-        """Log precision-recall curves for each finding."""
+        """Log precision-recall curves for each finding with fold prefix support."""
         ...
 
     def flush(self) -> None:
@@ -205,7 +217,17 @@ class NoOpLogger:
     ) -> None:
         pass
 
-    def log_graph(self, model: nn.Module, dummy_input: tuple[torch.Tensor, ...]) -> None:
+    def log_graph(self, model: nn.Module, dummy_input: tuple[torch.Tensor, ...]) -> bool:
+        return False
+
+    def log_histograms(
+        self,
+        model: nn.Module,
+        step: int,
+        only_trainable: bool = True,
+        prefix: str = "",
+        bins: int = 64,
+    ) -> None:
         pass
 
     def log_attention_heatmap(
@@ -226,6 +248,7 @@ class NoOpLogger:
         step: int,
         gold_mask: np.ndarray | torch.Tensor | None = None,
         label_cols: Sequence[str] | None = None,
+        prefix: str = "",
     ) -> None:
         pass
 
@@ -333,16 +356,51 @@ class TensorBoardLogger(NoOpLogger):
                 self.log_scalar(f"Slot_Presence/{slot_name}", rate, epoch)
 
     @_safe_telemetry
-    def log_graph(self, model: nn.Module, dummy_input: tuple[torch.Tensor, ...]) -> None:
-        """Log model computational graph on active device with DDP unwrapping."""
+    def log_graph(self, model: nn.Module, dummy_input: tuple[torch.Tensor, ...]) -> bool:
+        """Log model computational graph in eval() mode with torch.no_grad(). Returns True on success."""
         unwrapped_model = getattr(model, "module", model)
-        param = next(unwrapped_model.parameters(), None)
-        device = param.device if param is not None else torch.device("cpu")
-        placed_input = tuple(
-            inp.to(device) if isinstance(inp, torch.Tensor) else inp for inp in dummy_input
-        )
-        self.writer.add_graph(unwrapped_model, placed_input)
-        self.writer.flush()
+        was_training = unwrapped_model.training
+        unwrapped_model.eval()
+
+        try:
+            param = next(unwrapped_model.parameters(), None)
+            device = param.device if param is not None else torch.device("cpu")
+            placed_input = tuple(
+                inp.to(device) if isinstance(inp, torch.Tensor) else inp for inp in dummy_input
+            )
+            with torch.no_grad():
+                self.writer.add_graph(unwrapped_model, placed_input)
+                self.writer.flush()
+            return True
+        finally:
+            unwrapped_model.train(was_training)
+
+    @_safe_telemetry
+    def log_histograms(
+        self,
+        model: nn.Module,
+        step: int,
+        only_trainable: bool = True,
+        prefix: str = "",
+        bins: int = 64,
+    ) -> None:
+        """Log parameter weight and gradient distributions across training stages.
+
+        Filters non-finite gradients resulting from AMP unscaling overflow steps.
+        Uses bins=64 to control TensorBoard event file size.
+        """
+        unwrapped = getattr(model, "module", model)
+        pre = f"{prefix}/" if prefix else ""
+        for name, p in unwrapped.named_parameters():
+            if only_trainable and not p.requires_grad:
+                continue
+            clean_name = sanitize_tag(name)
+            self.writer.add_histogram(f"{pre}Weights/{clean_name}", p.detach().float().cpu(), step, bins=bins)
+            if p.grad is not None:
+                g = p.grad.detach().float()
+                g_finite = g[torch.isfinite(g)]
+                if g_finite.numel() > 0:
+                    self.writer.add_histogram(f"{pre}Gradients/{clean_name}", g_finite.cpu(), step, bins=bins)
 
     @_safe_telemetry
     def log_attention_heatmap(
@@ -402,8 +460,9 @@ class TensorBoardLogger(NoOpLogger):
         step: int,
         gold_mask: np.ndarray | torch.Tensor | None = None,
         label_cols: Sequence[str] | None = None,
+        prefix: str = "",
     ) -> None:
-        """Log precision-recall curves for each finding using expit probabilities."""
+        """Log precision-recall curves for each finding with fold prefix support."""
         if label_cols is None:
             label_cols = load_label_columns()
         else:
@@ -422,8 +481,8 @@ class TensorBoardLogger(NoOpLogger):
                 "gold_mask is None: skipping Synovitis PR curve to avoid evaluating on soft pseudo-labels.",
                 stacklevel=2,
             )
-
-        probs = expit(logits)
+        probs = expit(logits) if (np.nanmin(logits) < 0.0 or np.nanmax(logits) > 1.0) else logits
+        pre = f"{prefix}/" if prefix else ""
 
         for i, name in enumerate(label_cols):
             if i == synovitis_idx and gold_mask is None:
@@ -443,7 +502,7 @@ class TensorBoardLogger(NoOpLogger):
             y_tensor = torch.from_numpy(y_bin.astype(np.int64))
             p_tensor = torch.from_numpy(p)
 
-            tag = sanitize_tag(f"PR/{name}")
+            tag = sanitize_tag(f"{pre}PR/{name}")
             self.writer.add_pr_curve(tag, y_tensor, p_tensor, global_step=step)
 
     @_safe_telemetry

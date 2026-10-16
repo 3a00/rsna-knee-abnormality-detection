@@ -16,6 +16,7 @@ import warnings
 
 import numpy as np
 from scipy.special import expit
+from scipy.stats import rankdata
 from sklearn.metrics import average_precision_score, roc_auc_score
 import torch
 import torch.distributed as dist
@@ -81,6 +82,31 @@ class MetricsResult:
     label_stats: dict[str, LabelStats]
     n_valid_labels: int
     n_non_finite_logits: int
+
+
+def percentile_rank_transform(values: np.ndarray) -> np.ndarray:
+    """Compute empirical percentile rank in [0, 1] per column using average rank for ties.
+
+    Formula: (rankdata(X, method='average', axis=0) - 1.0) / (N - 1.0)
+    Maps the minimum value strictly to 0.0 and the maximum value strictly to 1.0.
+
+    Args:
+        values: 1D array of shape (N,) or 2D array of shape (N, C).
+
+    Returns:
+        Array of identical shape with values transformed to percentile ranks in [0, 1].
+
+    Raises:
+        ValueError: If values contains non-finite elements (NaN or Inf).
+    """
+    if not np.isfinite(values).all():
+        raise ValueError("percentile_rank_transform received non-finite values (NaN/Inf); rank would be corrupted.")
+
+    n = values.shape[0]
+    if n <= 1:
+        return np.zeros_like(values, dtype=np.float64)
+
+    return (rankdata(values, method="average", axis=0) - 1.0) / float(n - 1)
 
 
 def get_valid_label_mask_and_targets(
@@ -184,7 +210,7 @@ def compute_competition_metrics(
     label_stats: dict[str, LabelStats] = {}
 
     # Sigmoid probabilities used strictly for Average Precision
-    probs = expit(logits)
+    probs = expit(logits) if (np.nanmin(logits) < 0.0 or np.nanmax(logits) > 1.0) else logits
 
     for i, col in enumerate(label_cols):
         valid, y_bin = get_valid_label_mask_and_targets(

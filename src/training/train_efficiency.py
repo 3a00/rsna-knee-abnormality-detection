@@ -488,9 +488,20 @@ def impute_soft_synovitis(train_df: pd.DataFrame, label_cols: Sequence[str]) -> 
         raise KeyError("Missing required 'synovitis_soft' column in train labels DataFrame.")
 
     non_gold_mask = train_df["is_gold"] == 0
+
+    # In raw extracted labels, silence is marked by NaN or -1.
+    # In pre-binarized tables (e.g. pseudo_labels.csv), silence was mapped to 0.0
+    # while synovitis_soft preserves continuous probabilities (0.22 / 0.63).
     is_silent = train_df["Synovitis"].isna() | (train_df["Synovitis"] == -1)
+    if not is_silent.any():
+        is_silent = (train_df["Synovitis"] == 0.0) & (train_df["synovitis_soft"] > 0) & (train_df["synovitis_soft"] < 1)
+
     impute_mask = non_gold_mask & is_silent & train_df["synovitis_soft"].notna()
     n_imputed = int(impute_mask.sum())
+
+    already_imputed = int((non_gold_mask & (train_df["Synovitis"] > 0) & (train_df["Synovitis"] < 1)).sum())
+    if n_imputed == 0 and already_imputed > 0:
+        return already_imputed
 
     if is_silent.any() and n_imputed == 0:
         raise RuntimeError(
@@ -498,7 +509,9 @@ def impute_soft_synovitis(train_df: pd.DataFrame, label_cols: Sequence[str]) -> 
             "Verify that synovitis_soft column contains valid continuous probabilities."
         )
 
-    train_df.loc[impute_mask, "Synovitis"] = train_df.loc[impute_mask, "synovitis_soft"].astype(float)
+    if n_imputed > 0:
+        train_df.loc[impute_mask, "Synovitis"] = train_df.loc[impute_mask, "synovitis_soft"].astype(float)
+
     return n_imputed
 
 
