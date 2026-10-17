@@ -174,7 +174,7 @@ notebook = {
             "metadata": {},
             "outputs": [],
             "source": [
-                "import pandas as pd, shutil\n",
+                "import os, pandas as pd, shutil\n",
                 "\n",
                 "req_files = {\n",
                 "    'splits': WORKING_DIR / 'data/splits/cv_folds_3fold.csv',\n",
@@ -195,10 +195,12 @@ notebook = {
                 "assert 'synovitis_soft' in lab_df.columns, 'Labels missing required synovitis_soft column'\n",
                 "assert 'is_gold' in lab_df.columns or 'is_gold' in spl_df.columns, 'Missing required is_gold column'\n",
                 "\n",
-                "free_gb = shutil.disk_usage('/kaggle/tmp').free / 1e9\n",
+                "os.makedirs('/kaggle/tmp', exist_ok=True)\n",
+                "scratch_dir = '/kaggle/tmp' if os.path.isdir('/kaggle/tmp') else '/kaggle/working'\n",
+                "free_gb = shutil.disk_usage(scratch_dir).free / 1e9\n",
                 "print(f'Preflight OK: All scripts, splits, and backbone verified.')\n",
-                "print(f'Free disk on /kaggle/tmp: {free_gb:.1f} GB (336px 5-slice cache requires ~17 GB)')\n",
-                "assert free_gb >= 25.0, f'WARNING: Insufficient disk space on /kaggle/tmp ({free_gb:.1f} GB < 25 GB)'\n"
+                "print(f'Free disk on {scratch_dir}: {free_gb:.1f} GB (336px 5-slice cache requires ~17 GB)')\n",
+                "assert free_gb >= 25.0, f'WARNING: Insufficient disk space on {scratch_dir} ({free_gb:.1f} GB < 25 GB)'\n"
             ]
         },
         {
