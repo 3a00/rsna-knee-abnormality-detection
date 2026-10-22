@@ -82,6 +82,10 @@ _Avoid_: Direct uniform resizing, arbitrary pixel-count cropping.
 Randomly sampling a 3-consecutive-slice window ($[0:3]$, $[1:4]$, or $[2:5]$) from a pre-cached 5-slice physical stack ($[c-2 \dots c+2]$) during training to introduce volumetric variance without incurring DICOM decode I/O penalties.
 _Avoid_: Static single-triplet locking, online full-volume re-decoding.
 
+**Multi-Zone 2.5D Sampling**:
+Sampling multiple discrete 3-slice 2.5D triplets from anchored anatomical depth zones (Zone 1: ~25%, Zone 2: ~50%, Zone 3: ~75%) along the volume normal projection vector, ensuring peripheral joint compartments (meniscal horns, collateral ligaments) and central notch structures (cruciate ligaments) are simultaneously captured.
+_Avoid_: Single-center-window sampling, arbitrary random slice slicing.
+
 **Symmetry-Preserving MSK Augmentation**:
 Geometric and photometric transformations (mild rotation $\pm 7^\circ$, scale $0.93\text{--}1.07$, translation $\pm 4\%$, contrast $\pm 10\%$) applied uniformly across triplet slices while strictly prohibiting horizontal reflection to prevent swapping medial and lateral anatomical compartments.
 _Avoid_: Horizontal flipping, aggressive elastic distortion.
@@ -137,5 +141,9 @@ _Avoid_: Instantaneous full-model unfreezing, static feature extraction.
 **Percentile Rank Averaging**:
 An ensembling strategy where predicted probabilities from each cross-validation fold or architecture are normalized to empirical percentile ranks in $[0, 1]$ before weighted combination, preventing sharp probability distributions from dominating smoother ones.
 _Avoid_: Direct uncalibrated probability addition, unweighted arithmetic mean of heterogeneous outputs.
+
+**Normalized Task Loss Reweighting**:
+The application of per-label importance multipliers to multi-label BCE loss, normalized so the mean multiplier across all 12 targets is 1.0, increasing gradient pressure on low-performing anatomical targets without inflating the global loss magnitude or disrupting optimizer learning rates.
+_Avoid_: Unnormalized loss boosting, learning rate inflation.
 
 

@@ -1,5 +1,10 @@
 # RSNA Knee Abnormality Detection: Efficiency Track Specification (DINOv2-Small 6-Slot SlotHead)
 
+> [!WARNING]
+> **SUPERSEDED BY ISSUE 12 (Multi-Zone Sampling & Loss Reweighting)**
+> This specification originally described an 8-epoch, 3-stage schedule with 8 LLRD groups and 5-slice caching.
+> It has been formally superseded by Issue 12 (`.scratch/efficiency-track/issues/12-multizone-slice-sampling-and-loss-reweighting.md`) and ADR-0010, which define the production 14-epoch 4-stage schedule, 4 differential optimizer families, 9-slice multi-zone caching, and normalized task loss reweighting.
+
 **Status:** ready-for-agent
 **Target:** Kaggle RSNA Efficiency Track ($10,000+ Prize Category) & Standalone High-Speed Submission
 **Compute Target:** Dual Tesla T4 GPUs (Kaggle Environment), total test set inference ≤ 15 minutes

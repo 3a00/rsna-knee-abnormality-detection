@@ -59,17 +59,6 @@ RSNA_MRI/
 
 ---
 
-## Development Roadmap & Status Summary
-
-- **Phase 1 — EDA & Data Infrastructure:** ✅ Completed. DICOM loader with 3-priority classification, volume percentile normalization (0.5–99.5%), physics tag fallback.
-- **Phase 2 — Weak Label Extraction from Reports:** ✅ Completed. Two-tier LLM extraction (Gemini 3.7 Flash → 3.6 Flash) with selective silence imputation (`synovitis_soft` 0.22/0.63, structural absence to 0, acute tears to NaN). 100% gold concordance, ~95% spot-checked accuracy. See [ADR-0001](docs/adr/0001-two-tier-llm-weak-label-extraction-and-imputation.md).
-- **Phase 3 — Image Baseline:** 🏆 Baseline achieved (v16 3-Fold Mean Macro AUC: 0.8008 ± 0.0042 on Kaggle T4). 2.5D MIL architecture (EfficientNet-B2 + AttentionPooling). Active refinement in progress. See [ADR-0002](docs/adr/0002-2.5d-mil-with-attention-pooling.md), [ADR-0003](docs/adr/0003-single-gpu-execution-over-dataparallel.md), [ADR-0004](docs/adr/0004-tesla-t4-selection-over-p100.md).
-- **Phase 4 — Multimodal Fusion:** ⏳ Upcoming. Multilingual text encoder (XLM-RoBERTa) + late/feature fusion with image model.
-- **Phase 5 — Optimization & Ensembling:** ⏳ Upcoming. Multi-backbone ensembles (EfficientNet + ConvNeXt + DINOv2), calibration.
-- **Phase 6 — Final Kaggle Submission:** ⏳ Upcoming. Self-contained offline notebook running in ≤9 hours.
-
----
-
 ## Coding Conventions & File Categorization
 
 ### Code Standards
@@ -112,7 +101,6 @@ The project operates under a strict two-branch model:
 
 - The user (wenalz) acts as the **Architect and Supervisor** — they define strategy and review results.
 - The AI agent writes all Python code, notebooks, scripts, and debugging fixes.
-- Always explain design decisions clearly before implementing them.
 - When proposing a new experiment or approach, present it as a short plan first and wait for approval.
 - **Review Packaging (`/package`):** When asked to package an issue for review and write or implement code for it, write the complete proposed implementation *strictly inside the review document* (`docs/llm review/`) using the requested skill (e.g. `yagni full`). Do **not** implement, touch, or run code in the active repository until the review feedback has been received and approved.
 
