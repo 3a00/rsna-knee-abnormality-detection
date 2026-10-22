@@ -135,3 +135,35 @@ training:
   gold_weight: 5.0                    # Loss multiplier for 58 gold studies
   grad_clip_norm: 1.0                 # Gradient clipping max norm
   use_grad_checkpointing: true        # ~60% VRAM reduction via timm grad checkpointing
+
+# ============================================================================
+# Efficiency Track -- DINOv2-Small SlotHead Configuration (Source of Truth)
+# ============================================================================
+efficiency:
+  model:
+    backbone: "vit_small_patch14_dinov2.lvd142m"  # DINOv2-Small backbone
+    img_size: 336                                 # Input resolution (336x336)
+    n_slots: 6                                    # 6 MRI canonical slots
+    n_slices_per_slot: 9                          # 9 physical slices (3 zones x 3 slices)
+    n_zones: 3                                    # 3 compartments: 25%, 50%, 75% depth
+    n_tokens: 18                                  # 6 slots x 3 zones cross-attention tokens
+    embed_dim: 384                                # DINOv2-Small token dimension
+    num_heads: 6                                  # Cross-attention heads
+    attn_dropout_p: 0.2                           # Cross-attention dropout
+    pre_cls_dropout_p: 0.3                        # Pre-classifier dropout
+    slot_dropout_p: 0.0                           # Absent slot dropout probability
+
+  preprocess:
+    cache_dir: "/kaggle/tmp/rsna_cache_336_9slice" # 9-slice offline cache
+    sampling_strategy: "3zone"                    # 3-zone compartment-anchored sampling
+    crop_mm: 140.0                                # Physical FOV crop (140 mm)
+    format: "npz"                                 # Compressed float16 .npz archive
+
+  training:
+    n_epochs: 14                                  # 4-stage progressive unfreezing (2, 2, 3, 7)
+    batch_size: 4                                 # Micro-batch size per GPU (Dual Tesla T4)
+    grad_accum_steps: 2                           # Effective batch size = 4 x 2 = 8
+    target_label_boost: 1.75                      # Target boost on peripheral findings
+    boost_indices: [2, 3, 5, 6]                   # Medial Meniscus, Lateral Meniscus, Lateral OA, PF OA
+    gold_weight: 5.0                              # Supervision multiplier on n=58 gold studies
+    weight_decay: 0.05                            # Differential AdamW L2 regularization
