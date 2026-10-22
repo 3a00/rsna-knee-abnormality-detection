@@ -74,29 +74,6 @@ RSNA_MRI/
 
 ---
 
-## Git Branch Strategy & Remote Synchronization
-
-The project operates under a strict two-branch model:
-
-| Branch | Location | Purpose | Tracked Content |
-|---|---|---|---|
-| `private-work` | **Local only** | Daily development, experiments, notes | Everything (`notebooks/`, `docs/`, `.scratch/`, `AGENTS.md`, code) |
-| `main` | **Local & GitHub (`origin/main`)** | Public release mirror | Only production code (`src/`, `scripts/`, `tests/`, `config.yaml`, `CONTEXT.md`, `.gitignore`) |
-
-### Synchronization Rules
-- **NEVER** push `private-work` to `origin` (`git push origin private-work` is strictly forbidden).
-- To push code changes to GitHub:
-  ```bash
-  git checkout main
-  git checkout private-work -- src scripts tests config.yaml
-  git commit -m "feat: sync public code updates"
-  git push origin main
-  git checkout private-work
-  ```
-- All competition data (`data/`), checkpoints (`outputs/`), exploratory notebooks (`notebooks/`), and strategy documents (`docs/`, `.scratch/`, `AGENTS.md`) are ignored on `main` and permanently scrubbed from remote git history.
-
----
-
 ## Supervisor Notes
 
 - The user (wenalz) acts as the **Architect and Supervisor** — they define strategy and review results.
