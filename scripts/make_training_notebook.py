@@ -4,7 +4,7 @@ Generates the complete rsna_efficiency_training.ipynb notebook for Kaggle.
 Configured with:
   - Fail-fast preflight (Cell 3b) asserting all paths, splits, labels, scripts, and disk space before caching.
   - Unbuffered live subprocess streaming (run_live) so cells never run blind.
-  - One-time 336px physical FOV pre-caching (~97 min).
+  - One-time 336px 9-slice multi-zone pre-caching (~97 min).
   - Multi-Fold sequential DDP training across all 3 folds (--folds 0,1,2).
   - Full 3-fold OOF evaluation (scripts/evaluate_3fold_oof.py) with ddof=1 CV statistics.
   - Clean weights inventory in outputs/weights/.
@@ -98,6 +98,15 @@ notebook = {
                 "        zf.extractall(WORKING_DIR)\n",
                 "    codebase_found = True\n",
                 "    break\n",
+                "\n",
+                "if not codebase_found:\n",
+                "    for item in glob.glob('/kaggle/input/**/rsna_efficiency_codebase.tar', recursive=True):\n",
+                "        print(f'Extracting codebase tar: {item}')\n",
+                "        import tarfile\n",
+                "        with tarfile.open(item, 'r') as tf:\n",
+                "            tf.extractall(WORKING_DIR)\n",
+                "        codebase_found = True\n",
+                "        break\n",
                 "\n",
                 "if not codebase_found:\n",
                 "    for root, dirs, files in os.walk('/kaggle/input'):\n",
@@ -199,16 +208,16 @@ notebook = {
                 "scratch_dir = '/kaggle/tmp' if os.path.isdir('/kaggle/tmp') else '/kaggle/working'\n",
                 "free_gb = shutil.disk_usage(scratch_dir).free / 1e9\n",
                 "print(f'Preflight OK: All scripts, splits, and backbone verified.')\n",
-                "print(f'Free disk on {scratch_dir}: {free_gb:.1f} GB (336px 5-slice cache requires ~17 GB)')\n",
-                "assert free_gb >= 25.0, f'WARNING: Insufficient disk space on {scratch_dir} ({free_gb:.1f} GB < 25 GB)'\n"
+                "print(f'Free disk on {scratch_dir}: {free_gb:.1f} GB (336px 9-slice cache requires ~30 GB)')\n",
+                "assert free_gb >= 45.0, f'WARNING: Insufficient disk space on {scratch_dir} ({free_gb:.1f} GB < 45 GB)'\n"
             ]
         },
         {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "## Cell 4: Idempotent 5-Slice Volume Pre-Caching (~97 min)\n",
-                "Pre-extracts 5 centered physical slices per present slot into `/kaggle/tmp/rsna_cache_336_140mm`. Idempotent on restart."
+                "## Cell 4: Idempotent 9-Slice Multi-Zone Volume Pre-Caching (~97 min)\n",
+                "Pre-extracts 9 multi-zone physical slices per present slot into `/kaggle/tmp/rsna_cache_336_9slice`. Idempotent on restart."
             ]
         },
         {
@@ -225,7 +234,7 @@ notebook = {
                 "if dicom_root is None:\n",
                 "    dicom_root = Path('/kaggle/input/rsna-knee-abnormality-detection')\n",
                 "train_series_csv = dicom_root / 'train_series.csv'\n",
-                "cache_dir = Path('/kaggle/tmp/rsna_cache_336_140mm')\n",
+                "cache_dir = Path('/kaggle/tmp/rsna_cache_336_9slice')\n",
                 "cache_dir.mkdir(parents=True, exist_ok=True)\n",
                 "\n",
                 "preprocess_cmd = [\n",
@@ -259,8 +268,9 @@ notebook = {
                 "    sys.executable, 'scripts/train_ddp_efficiency.py',\n",
                 "    '--folds', '0,1,2',\n",
                 "    '--epochs', '14',\n",
-                "    '--batch-size', '8',\n",
-                "    '--grad-accum-steps', '1',\n",
+                "    '--batch-size', '4',\n",
+                "    '--grad-accum-steps', '2',\n",
+                "    '--target-label-boost', '1.75',\n",
                 "    '--img-size', '336',\n",
                 "    '--crop-mm', '140.0',\n",
                 "    '--weight-decay', '0.05',\n",
@@ -337,9 +347,12 @@ notebook = {
     "nbformat_minor": 5
 }
 
-output_path = Path("notebooks/rsna_efficiency_training.ipynb")
-output_path.parent.mkdir(parents=True, exist_ok=True)
-with open(output_path, "w") as f:
-    json.dump(notebook, f, indent=2)
-
-print(f"Generated {output_path} ({output_path.stat().st_size} bytes)")
+output_paths = [
+    Path("notebooks/rsna_efficiency_training.ipynb"),
+    Path(".scratch/efficiency_kernel/rsna-efficiency-track-ddp-training.ipynb"),
+]
+for p in output_paths:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w") as f:
+        json.dump(notebook, f, indent=2)
+    print(f"Generated {p} ({p.stat().st_size} bytes)")

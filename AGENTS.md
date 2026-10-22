@@ -27,14 +27,6 @@
 > [!IMPORTANT]
 > **NEVER hardcode absolute file paths** inside `src/` modules. Always reference `config.yaml` or function arguments.
 
-> [!CAUTION]
-> **NEVER push `private-work` to GitHub (`origin`).**
-> - The GitHub remote (`origin/main`) is public.
-> - `main` tracks ONLY clean code (`src/`, `scripts/`, `tests/`, `config.yaml`, `CONTEXT.md`, `.gitignore`). All data, outputs, notebooks, docs, and scratch files are ignored and scrubbed from history.
-> - `private-work` is strictly for local development and tracking of full files.
-> - Sync to GitHub ONLY via:
->   `git checkout main && git checkout private-work -- src scripts tests config.yaml && git commit -m "sync" && git push origin main && git checkout private-work`
-
 ---
 
 ## Repository Structure

@@ -4,7 +4,7 @@
 
 **Blocked by:** 11: Multi-Fold Pipeline Runner (Folds 1 & 2), Percentile Rank OOF Evaluation & Single-Model Refinement
 
-**Status:** ready-for-agent
+**Status:** completed
 
 ---
 
@@ -138,7 +138,7 @@ The 5-slice dataset tests in `tests/test_caching_and_regularization.py` (`test_d
   - Test `test_tensorboard_logger_smoke_scalar` with `TensorBoardLogger(log_dir=tmp_path)`.
   - Test `test_efficiency_study_dataset_rejects_legacy_5slice_npz` and `test_efficiency_study_dataset_raises_on_missing_npz`.
   - Test closed-form task loss gradients and optimizer family coverage.
-- [ ] **Notebook Synchronization & Kaggle Deployment (`scripts/make_training_notebook.py`)**:
+- [x] **Notebook Synchronization & Kaggle Deployment (`scripts/make_training_notebook.py`)**:
   - Update pre-caching command to `/kaggle/tmp/rsna_cache_336_9slice` with `assert free_gb >= 45.0`.
   - Update DDP command to `--batch-size 4 --grad-accum-steps 2 --target-label-boost 1.75`.
   - Regenerate `notebooks/rsna_efficiency_training.ipynb`.
