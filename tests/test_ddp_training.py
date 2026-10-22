@@ -156,7 +156,7 @@ def _accum_worker(
     optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     mask = torch.ones(2, 6)
     target = torch.zeros(2, 12)
 
@@ -240,7 +240,7 @@ def _all_absent_worker(
     optimizer = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     # Rank 0 has all absent slots; Rank 1 has active slots
     mask = torch.zeros(2, 6) if rank == 0 else torch.ones(2, 6)
     target = torch.zeros(2, 12)

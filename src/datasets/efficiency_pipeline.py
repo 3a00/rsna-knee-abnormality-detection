@@ -453,6 +453,9 @@ def normalize_volume_dinov2(
         # Indices [1, 2, 3] map to ImageNet R, G, B ([0.485, 0.456, 0.406])
         mean = np.array([0.456, 0.485, 0.456, 0.406, 0.456], dtype=np.float32).reshape(5, 1, 1)
         std = np.array([0.224, 0.229, 0.224, 0.225, 0.224], dtype=np.float32).reshape(5, 1, 1)
+    elif k == 9:
+        mean = np.tile(IMAGENET_MEAN.flatten(), 3).reshape(9, 1, 1)
+        std = np.tile(IMAGENET_STD.flatten(), 3).reshape(9, 1, 1)
     else:
         mean = float(np.mean(IMAGENET_MEAN))
         std = float(np.mean(IMAGENET_STD))
@@ -706,6 +709,133 @@ def process_study_to_5slice_cache(
     return t_res, m_res
 
 
+def select_multizone_slice_paths(
+    headers: Sequence[DICOMHeaderMeta],
+    num_zones: int = 3,
+) -> list[str]:
+    """Select num_zones x 3 slice paths anchored at (z+1)/(num_zones+1) of the physical stack.
+
+    Slices are deduplicated across echoes and sorted by canonical normal projection k.
+    Thin-slice 3D series (median spacing < 1.5 mm with physical coords) use the slices nearest
+    to +/-3.0 mm around each zone centre; otherwise index offsets [c-1, c, c+1] are used.
+    Short series are boundary-clamped, so the output always has num_zones * 3 entries.
+    """
+    deduped = deduplicate_multi_echo_slices(headers)
+    sorted_h = sorted(deduped, key=lambda x: (x.k_pos, x.instance_number, x.path))
+    n = len(sorted_h)
+    if n == 0:
+        return []
+
+    ks = np.array([h.k_pos for h in sorted_h], dtype=np.float64)
+    thin = False
+    if sorted_h[0].has_physical_coords and n >= 5:
+        diffs = np.abs(np.diff(ks))
+        diffs = diffs[diffs > 1e-4]
+        thin = bool(diffs.size and float(np.median(diffs)) < 1.5)
+
+    idxs: list[int] = []
+    for z in range(num_zones):
+        c = int(round((z + 1) / (num_zones + 1) * (n - 1)))
+        if thin:
+            left = int(np.argmin(np.abs(ks - (ks[c] - 3.0))))
+            right = int(np.argmin(np.abs(ks - (ks[c] + 3.0))))
+            idxs.extend([left, c, right])
+        else:
+            idxs.extend([c - 1, c, c + 1])
+    idxs = np.clip(np.array(idxs), 0, n - 1).tolist()
+    return [sorted_h[i].path for i in idxs]
+
+
+def process_study_to_9slice_cache(
+    study_dir: str | Path,
+    series_metadata: Optional[dict[str, Any]] = None,
+    num_workers: int = 0,
+    target_size: int = 336,
+    crop_mm: float = DEFAULT_CROP_MM,
+    return_info: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    """Process a study into a (6, 9, S, S) float16 tensor (3 zones x 3 slices per slot) and a (6,) presence mask."""
+    study_path = Path(study_dir)
+    dcm_files = [str(f) for f in sorted(study_path.rglob("*")) if f.is_file() and not f.name.startswith(".")]
+
+    tensor = np.zeros((NUM_SLOTS, 9, target_size, target_size), dtype=np.float32)
+    presence = np.zeros(NUM_SLOTS, dtype=np.float32)
+    state = {"clipped": False}
+    active: list[int] = []
+
+    def _finish():
+        t, m = torch.from_numpy(tensor).half(), torch.from_numpy(presence)
+        if return_info:
+            return t, m, {"clipped": state["clipped"], "active_slots": active}
+        return t, m
+
+    if not dcm_files:
+        return _finish()
+
+    def _parse(f: str) -> Optional[DICOMHeaderMeta]:
+        return parse_dicom_header_fast(f, series_metadata=series_metadata)[0]
+
+    if num_workers > 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as ex:
+            metas = list(ex.map(_parse, dcm_files))
+    else:
+        metas = [_parse(f) for f in dcm_files]
+    headers = [m for m in metas if m is not None]
+    if not headers:
+        return _finish()
+
+    groups: dict[str, list[DICOMHeaderMeta]] = {}
+    for h in headers:
+        groups.setdefault(h.series_uid, []).append(h)
+
+    cands_by_slot: dict[int, list[tuple[tuple[int, int, int], str, list[DICOMHeaderMeta]]]] = {}
+    for uid in sorted(groups):
+        s_headers = groups[uid]
+        sample = s_headers[0]
+        slot = route_series_to_slot(sample.plane, sample.is_fluid, sample.is_fs)
+        if slot is None:
+            continue
+        deduped = deduplicate_multi_echo_slices(s_headers)
+        n_k = len(deduped)
+        if n_k < 1:
+            continue
+        k_vals = sorted(h.k_pos for h in deduped)
+        diffs = [abs(k_vals[i + 1] - k_vals[i]) for i in range(n_k - 1) if abs(k_vals[i + 1] - k_vals[i]) > 1e-4]
+        med_sp = float(np.median(diffs)) if diffs else 3.0
+        if sample.has_physical_coords:
+            is_2d = int(1.5 <= med_sp <= 6.0 and 10 <= n_k <= 80)
+        else:
+            is_2d = int(10 <= n_k <= 80)
+        fs_pri = int(sample.is_fs) if slot in (0, 1, 2) else 0
+        cands_by_slot.setdefault(slot, []).append(((-fs_pri, -is_2d, -n_k), uid, s_headers))
+
+    for slot_idx, cands in cands_by_slot.items():
+        cands.sort(key=lambda c: (c[0], c[1]))
+        for _, _uid, s_headers in cands:
+            paths = select_multizone_slice_paths(s_headers)
+            if len(paths) != 9:
+                continue
+            try:
+                raw = decode_slices(paths)
+                if raw is None:
+                    continue
+                cropped, crop_info = crop_and_resize_140mm(
+                    raw, pixel_spacing=s_headers[0].pixel_spacing, target_size=target_size, crop_mm=crop_mm
+                )
+                if crop_info.clipped:
+                    state["clipped"] = True
+                normed, ok = normalize_volume_dinov2(cropped)
+                if not ok:
+                    continue
+                tensor[slot_idx] = normed
+                presence[slot_idx] = 1.0
+                active.append(slot_idx)
+                break
+            except Exception:
+                continue
+    return _finish()
+
+
 def process_study_to_6slot(
     study_dir: str | Path,
     series_metadata: Optional[dict[str, tuple[Optional[int], Optional[int], str]]] = None,
@@ -893,8 +1023,10 @@ def verify_cache(
     target_size: int = 336,
     crop_mm: float = DEFAULT_CROP_MM,
     max_fail_frac: float = 0.005,
+    expected_slices: Optional[int] = 9,
+    expected_strategy: Optional[str] = "3zone",
 ) -> tuple[list[str], list[str]]:
-    """Verify cache manifest provenance and confirm all studies exist as .npz or .pt archives.
+    """Verify cache manifest provenance and confirm all studies exist as .npz archives.
 
     Args:
         cache_dir: Directory containing cached study archives and manifest.
@@ -902,6 +1034,8 @@ def verify_cache(
         target_size: Expected spatial resolution in pixels (default: 336).
         crop_mm: Expected physical field of view in millimeters (default: 140.0).
         max_fail_frac: Maximum allowed fraction of failed studies before erroring (default: 0.005).
+        expected_slices: Expected number of slices per slot in cache (default: 9).
+        expected_strategy: Expected slice sampling strategy (default: '3zone').
 
     Returns:
         Tuple of (valid_uids, empty_uids).
@@ -922,12 +1056,22 @@ def verify_cache(
     if m.get("in_progress", False):
         raise RuntimeError(f"Cache build at {d} is incomplete (in_progress=True). Re-run preprocess script.")
 
+    if "format" not in m or m.get("format") != "npz":
+        raise RuntimeError(f"Cache format mismatch: expected 'npz', got {m.get('format')}")
+
     if (
         int(m.get("target_size", 0)) != target_size
         or abs(float(m.get("crop_mm", 0.0)) - crop_mm) > 1e-4
-        or m.get("format", "pt") not in ("npz", "pt")
     ):
         raise RuntimeError(f"Cache provenance mismatch in {manifest_p}: {m}")
+
+    if expected_slices is not None:
+        if int(m.get("n_slices_cached", -1)) != expected_slices:
+            raise RuntimeError(f"Cache n_slices_cached mismatch: expected {expected_slices}, got {m.get('n_slices_cached')}")
+
+    if expected_strategy is not None:
+        if m.get("sampling_strategy") != expected_strategy:
+            raise RuntimeError(f"Cache sampling_strategy mismatch: expected {expected_strategy}, got {m.get('sampling_strategy')}")
 
     failed_set = set(m.get("failed_uids", []))
     empty_uids = list(m.get("empty_uids", []))
@@ -936,7 +1080,7 @@ def verify_cache(
         raise RuntimeError(f"Cache failure rate ({len(failed_set)}) exceeds threshold ({max_allowed_failures})")
 
     valid_uids = [u for u in uids if u not in failed_set]
-    missing = [u for u in valid_uids if not ((d / f"{u}.npz").is_file() or (d / f"{u}.pt").is_file())]
+    missing = [u for u in valid_uids if not (d / f"{u}.npz").is_file()]
     if missing:
         raise RuntimeError(f"{len(missing)} studies missing from cache: e.g. {missing[:5]}")
 

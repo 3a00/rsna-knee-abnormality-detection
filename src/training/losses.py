@@ -1,3 +1,4 @@
+# filepath: src/training/losses.py
 """
 losses.py -- Loss Functions for RSNA Knee MRI Training
 
@@ -21,9 +22,29 @@ Core rules:
 
 from __future__ import annotations
 
+from typing import Sequence
+import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+NUM_TARGETS = 12
+DEFAULT_BOOST_TARGETS = (2, 3, 5, 6)  # Medial Meniscus, Lateral Meniscus, Lateral OA, PF OA
+
+
+def compute_task_weights(
+    target_boost: float = 1.75,
+    boost_indices: Sequence[int] = DEFAULT_BOOST_TARGETS,
+    num_targets: int = NUM_TARGETS,
+) -> torch.Tensor:
+    """Compute normalized 12-element task loss multipliers with mean 1.0."""
+    raw_weights = np.ones(num_targets, dtype=np.float32)
+    for idx in boost_indices:
+        raw_weights[idx] = float(target_boost)
+    normalized = raw_weights / float(np.mean(raw_weights))
+    return torch.from_numpy(normalized)
 
 
 class MaskedBCEWithLogitsLoss(nn.Module):
@@ -51,12 +72,17 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         pos_weight: torch.Tensor | None = None,
         reduction: str = "mean",
         continuous_pos_weight: bool = True,
+        task_weights: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self.gold_weight = gold_weight
         self.pos_weight  = pos_weight
         self.reduction   = reduction
         self.continuous_pos_weight = continuous_pos_weight
+        if task_weights is not None:
+            self.register_buffer("task_weights", torch.as_tensor(task_weights, dtype=torch.float32))
+        else:
+            self.task_weights = None
 
     def forward(
         self,
@@ -100,6 +126,9 @@ class MaskedBCEWithLogitsLoss(nn.Module):
                     torch.ones_like(logits),
                 )
             sample_weights = sample_weights * label_weights
+
+        if self.task_weights is not None:
+            sample_weights = sample_weights * self.task_weights.to(logits.device).unsqueeze(0)
 
         # Raw BCE (no reduction) then apply mask and sample weights
         bce      = F.binary_cross_entropy_with_logits(

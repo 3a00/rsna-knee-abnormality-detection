@@ -98,7 +98,7 @@ def make_synthetic_cache_npz(
 
     study_uids = [f"synth_{i:04d}" for i in range(n_studies)]
     for uid in study_uids:
-        tensor = np.random.randn(6, 5, img_size, img_size).astype(np.float16)
+        tensor = np.random.randn(6, 9, img_size, img_size).astype(np.float16)
         mask = np.array([1.0, 1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
         with open(cache_dir / f"{uid}.npz", "wb") as f:
             np.savez_compressed(f, image=tensor, presence_mask=mask, clipped=np.uint8(0))
@@ -106,7 +106,8 @@ def make_synthetic_cache_npz(
     manifest = {
         "target_size": img_size,
         "crop_mm": 140.0,
-        "n_slices_cached": 5,
+        "n_slices_cached": 9,
+        "sampling_strategy": "3zone",
         "format": "npz",
         "in_progress": False,
         "failed_uids": [],
@@ -143,26 +144,25 @@ def make_synthetic_cache(
 
     uids = [f"smoke_study_{i:03d}" for i in range(n_studies)]
     for uid in uids:
-        tensor = torch.randn(NUM_SLOTS, 5, img_size, img_size, dtype=torch.float16)
-        presence = torch.tensor([1.0] * n_present + [0.0] * (NUM_SLOTS - n_present), dtype=torch.float32)
-        torch.save({
-            "image": tensor,
-            "presence_mask": presence,
-            "meta": {"target_size": img_size, "crop_mm": 140.0, "n_slices_cached": 5},
-        }, cache_dir / f"{uid}.pt")
+        tensor = np.random.randn(NUM_SLOTS, 9, img_size, img_size).astype(np.float16)
+        presence = np.array([1.0] * n_present + [0.0] * (NUM_SLOTS - n_present), dtype=np.float32)
+        with open(cache_dir / f"{uid}.npz", "wb") as f:
+            np.savez_compressed(f, image=tensor, presence_mask=presence, clipped=np.uint8(0))
 
     manifest = {
         "target_size": img_size,
         "crop_mm": 140.0,
-        "n_slices_cached": 5,
+        "n_slices_cached": 9,
+        "sampling_strategy": "3zone",
         "total_studies_expected": n_studies,
         "total_cached_files": n_studies,
         "failed_uids": [],
         "empty_uids": [],
         "in_progress": False,
-        "format": "pt",
+        "format": "npz",
     }
-    (cache_dir / "cache_manifest.json").write_text(json.dumps(manifest))
+    with open(cache_dir / "cache_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
 
     splits_csv = root_dir / "splits.csv"
     fold_ids = [0 if i < n_val else 1 for i in range(n_studies)]
@@ -231,7 +231,7 @@ def _smoke_worker(
     for stage in range(1, 5):
         # 1. Forward & Backward on real step with rank-divergent synthetic data
         torch.manual_seed(1234 + rank + stage * 10)
-        synth_images = torch.randn(2, 6, 3, img_size, img_size, device=device)
+        synth_images = torch.randn(2, 6, 9, img_size, img_size, device=device)
         synth_masks = torch.ones(2, 6, device=device)
         synth_targets = torch.randint(0, 2, (2, 12), device=device).float()
         synth_gold = torch.tensor([0, 1], device=device)
@@ -266,7 +266,7 @@ def _smoke_worker(
     # Acceptance Criterion 10: VRAM Footprint Check under Stage 4 batch 8 with all 6 slots
     if is_cuda:
         torch.cuda.reset_peak_memory_stats()
-        b8_images = torch.randn(8, 6, 3, img_size, img_size, device=device)
+        b8_images = torch.randn(8, 6, 9, img_size, img_size, device=device)
         b8_masks = torch.ones(8, 6, device=device)
         b8_targets = torch.randint(0, 2, (8, 12), device=device).float()
         b8_gold = torch.zeros(8, device=device)

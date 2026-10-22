@@ -35,7 +35,7 @@ import pytest
 import timm
 import torch
 
-from src.models.dinov2_slothead import DINOv2SlotHead
+from src.models.dinov2_slothead import DINOv2SlotHead, TOTAL_TOKENS
 
 # Set global seed for reproducible test batch synthesis
 torch.manual_seed(42)
@@ -47,7 +47,7 @@ def test_model_forward_shapes():
     model.eval()
 
     b, s = 2, 6
-    x = torch.randn(b, s, 3, 112, 112)
+    x = torch.randn(b, s, 9, 112, 112)
     mask = torch.ones(b, s)
 
     with torch.no_grad():
@@ -63,7 +63,7 @@ def test_model_336_resolution():
     model = DINOv2SlotHead(img_size=336, pretrained=False)
     model.eval()
 
-    x = torch.randn(1, 6, 3, 336, 336)
+    x = torch.randn(1, 6, 9, 336, 336)
     mask = torch.ones(1, 6)
 
     with torch.no_grad():
@@ -87,7 +87,7 @@ def test_present_slot_gathering_efficiency():
 
     model.backbone.forward = hook_forward
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     mask = torch.tensor([
         [1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
         [1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
@@ -97,8 +97,8 @@ def test_present_slot_gathering_efficiency():
         logits = model(x, mask)
 
     assert len(calls) == 1
-    # Backbone must be called with exactly 5 slices, NOT 2 * 6 = 12 slices!
-    assert calls[0] == torch.Size([5, 3, 112, 112])
+    # 5 active slots x 3 zones = 15 triplets forwarded to backbone
+    assert calls[0] == torch.Size([15, 3, 112, 112])
     assert logits.shape == (2, 12)
 
 
@@ -107,7 +107,7 @@ def test_unconditional_fp32_head_stability():
     model = DINOv2SlotHead(img_size=112, pretrained=False)
     model.eval()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     mask = torch.ones(2, 6)
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -122,7 +122,7 @@ def test_cpu_amp_smoke():
     model = DINOv2SlotHead(img_size=112, pretrained=False)
     model.train()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]])
 
     with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -183,7 +183,7 @@ def test_state_dict_roundtrip_inference_parity():
     model_b.eval()
     model_b.load_state_dict(torch.load(buffer, weights_only=True), strict=True)
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0], [1.0, 0.0, 1.0, 1.0, 1.0, 1.0]])
 
     with torch.no_grad():
@@ -210,7 +210,7 @@ def test_offline_weights_resampling_clean_load():
         assert model_resampled.backbone.pos_embed.shape == (1, 65, 384)
 
         # Forward pass runs cleanly
-        x = torch.randn(1, 6, 3, 112, 112)
+        x = torch.randn(1, 6, 9, 112, 112)
         mask = torch.ones(1, 6)
         with torch.no_grad():
             out = model_resampled(x, mask)
@@ -226,7 +226,7 @@ def test_all_absent_batch_ddp_guard():
     model = DINOv2SlotHead(img_size=112, pretrained=False)
     model.train()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     all_absent = torch.zeros(2, 6)
 
     logits = model(x, all_absent)
@@ -248,7 +248,7 @@ def test_forward_with_attention_contract():
     model.eval()
 
     b, s = 2, 6
-    x = torch.randn(b, s, 3, 112, 112)
+    x = torch.randn(b, s, 9, 112, 112)
     mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0], [1.0, 0.0, 1.0, 1.0, 1.0, 1.0]])
 
     with torch.no_grad():
@@ -256,12 +256,12 @@ def test_forward_with_attention_contract():
         logits_diag, attn = model.forward_with_attention(x, mask)
 
     assert torch.allclose(logits_std, logits_diag, atol=1e-5), "Parity mismatch between forward methods!"
-    assert attn.shape == (b, 12, s)
+    assert attn.shape == (b, 12, TOTAL_TOKENS)
     assert torch.isfinite(attn).all()
 
-    # Absent slots strictly 0.0
-    assert (attn[0, :, 5] == 0.0).all()
-    assert (attn[1, :, 1] == 0.0).all()
+    # Absent slots strictly 0.0 across all 3 depth zone tokens
+    assert (attn[0, :, 15:18] == 0.0).all()
+    assert (attn[1, :, 3:6] == 0.0).all()
 
     # Present slots sum to 1.0 per finding
     assert torch.allclose(attn[0].sum(dim=-1), torch.ones(12), atol=1e-5)
@@ -338,7 +338,7 @@ def test_absent_slot_pixel_safety():
     model = DINOv2SlotHead(img_size=112, pretrained=False)
     model.train()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     x[0, 5] = float("nan")  # Slot 5 is absent
     x[1, 2] = float("inf")  # Slot 2 is absent
     mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 0.0], [1.0, 1.0, 0.0, 1.0, 1.0, 1.0]])
@@ -359,7 +359,7 @@ def test_gradient_flow_trainable_parameters():
     model = DINOv2SlotHead(img_size=112, pretrained=False)
     model.train()
 
-    x = torch.randn(2, 6, 3, 112, 112)
+    x = torch.randn(2, 6, 9, 112, 112)
     mask = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0, 1.0, 0.0]])
 
     logits = model(x, mask)

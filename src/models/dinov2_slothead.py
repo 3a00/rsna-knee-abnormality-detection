@@ -1,45 +1,35 @@
+# filepath: src/models/dinov2_slothead.py
 """src/models/dinov2_slothead.py
 
-DINOv2-Small backbone + 6-Slot SlotHead cross-attention architecture
-for RSNA Knee Abnormality Detection (Efficiency Track).
-
+DINOv2-Small backbone + 18-token (6 slots x 3 depth zones) SlotHead cross-attention
+architecture for RSNA Knee Abnormality Detection (Efficiency Track).
 Single-Responsibility Module: purely defines the neural network architecture.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-
 import timm
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+logger = logging.getLogger(__name__)
+
+NUM_SLOTS, NUM_ZONES = 6, 3
+TOTAL_TOKENS = NUM_SLOTS * NUM_ZONES
+NUM_CLASSES = 12
+
 
 class DINOv2SlotHead(nn.Module):
-    """DINOv2-Small vision transformer with SlotHead cross-attention pooling.
-
-    Key Architectural Principles:
-      1. Present-Slot Gathering: Only present sequences are forwarded through DINOv2,
-         saving FLOPs proportional to absent sequence frequency (slots 3-5 absent in ~40-60% of studies).
-      2. Unconditional FP32 SlotHead: Cross-attention, LayerNorm, and linear heads run
-         strictly in FP32 with autocast disabled, guaranteeing mathematical immunity
-         to FP16 overflow without reactive GPU-to-CPU sync bubbles.
-      3. DDP Gradient Guard: All-absent batches execute a dummy 1-slice forward pass so
-         backbone parameters always participate in gradient synchronization across ranks.
-      4. Label Prior Bias Initialization: Initializes cls_b to log(p / (1 - p)) to stabilize
-         early training on highly imbalanced finding distributions.
-      5. Slot Dropout: Randomly drops present slots during training (slot_dropout_p=0.10-0.15
-         configured in training recipe; default is 0.0) to build robustness against missing sequences.
-      6. Clean Return Typing: Standard forward() returns strictly raw logits of shape (B, 12).
-         Diagnostic forward_with_attention() returns (logits, attn_weights).
-    """
+    """DINOv2-Small with 18-token (6 slots x 3 depth zones) SlotHead cross-attention."""
 
     def __init__(
         self,
         embed_dim: int = 384,
-        num_slots: int = 6,
-        num_findings: int = 12,
+        num_slots: int = NUM_SLOTS,
+        num_findings: int = NUM_CLASSES,
         num_heads: int = 6,
         img_size: int = 336,
         pretrained: bool = False,
@@ -50,22 +40,6 @@ class DINOv2SlotHead(nn.Module):
         init_bias_priors: list[float] | torch.Tensor | None = None,
         use_grad_checkpointing: bool = True,
     ) -> None:
-        """Initializes the DINOv2SlotHead model.
-
-        Args:
-            embed_dim: Latent feature dimension (default: 384 for DINOv2-Small).
-            num_slots: Number of anatomical contrast sequence slots (default: 6).
-            num_findings: Number of binary clinical abnormality targets (default: 12).
-            num_heads: Multi-head attention heads count (default: 6).
-            img_size: Input spatial dimension in pixels (default: 336).
-            pretrained: Whether to download pretrained weights via timm (default: False for offline compliance).
-            weights_path: Path to offline .pth checkpoint for weight loading and pos_embed resampling.
-            slot_dropout_p: Probability of dropping present slots during training (default: 0.0).
-            attn_dropout_p: Cross-attention dropout probability (default: 0.2).
-            pre_cls_dropout_p: Pre-classifier dropout probability (default: 0.3).
-            init_bias_priors: Empirical positive label priors for zero-step BCE log-odds bias initialization.
-            use_grad_checkpointing: Whether to enable non-reentrant gradient checkpointing through blocks.
-        """
         super().__init__()
         self.embed_dim = embed_dim
         self.num_slots = num_slots
@@ -77,7 +51,7 @@ class DINOv2SlotHead(nn.Module):
         self.pre_cls_dropout_p = pre_cls_dropout_p
         self.use_grad_checkpointing = use_grad_checkpointing
 
-        # Backbone: DINOv2-Small patch14 (consistent .lvd142m tag)
+        # Backbone: DINOv2-Small patch14
         if weights_path is not None:
             if not os.path.exists(weights_path):
                 raise FileNotFoundError(f"Offline weights not found: {weights_path}")
@@ -96,7 +70,6 @@ class DINOv2SlotHead(nn.Module):
                 img_size=img_size,
             )
 
-        # Verify positional embedding tokens contract; raise ValueError (immune to python -O)
         expected_tokens = 1 + (img_size // 14) ** 2
         if self.backbone.pos_embed.shape[1] != expected_tokens:
             raise ValueError(
@@ -104,14 +77,14 @@ class DINOv2SlotHead(nn.Module):
                 f"got {self.backbone.pos_embed.shape[1]}"
             )
 
-        # Slot identity embeddings: E_slot in R^(6 x D)
-        # Initialized with std=0.20 (~20% of DINOv2 LayerNorm feature std ~1.0, norm ~19.6)
+        # Slot and Zone identity embeddings (factored additive, std=0.20)
         self.slot_embed = nn.Parameter(torch.randn(num_slots, embed_dim) * 0.20)
+        self.zone_embed = nn.Parameter(torch.randn(NUM_ZONES, embed_dim) * 0.20)
 
-        # 12 finding-specific query vectors: Q in R^(12 x D)
+        # 12 finding-specific query vectors
         self.finding_queries = nn.Parameter(torch.randn(num_findings, embed_dim) * 0.02)
 
-        # Multi-head cross-attention: findings query contrast slots
+        # Multi-head cross-attention over 18 slot-zone tokens (default: 6 heads per spec)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -119,7 +92,7 @@ class DINOv2SlotHead(nn.Module):
             batch_first=True,
         )
 
-        # Residual LayerNorm
+        # Residual LayerNorm: LayerNorm(Q + Attn)
         self.norm = nn.LayerNorm(embed_dim)
 
         # Pre-classifier dropout regularization
@@ -128,9 +101,6 @@ class DINOv2SlotHead(nn.Module):
         # Per-finding linear classification head (12, D)
         self.cls_w = nn.Parameter(torch.randn(num_findings, embed_dim) * 0.02)
 
-        # Initialize cls_b from prior probabilities or log-odds
-        # Note: under loss weighting w_f = 1 + (pos_weight - 1) * y, the theoretical optimal bias
-        # shifts by ~log(pos_weight), but empirical log(p / (1 - p)) provides stable zero-step BCE init.
         if init_bias_priors is not None:
             priors = torch.as_tensor(init_bias_priors, dtype=torch.float32).clamp(1e-4, 1.0 - 1e-4)
             self.cls_b = nn.Parameter(torch.log(priors / (1.0 - priors)))
@@ -138,28 +108,13 @@ class DINOv2SlotHead(nn.Module):
             self.cls_b = nn.Parameter(torch.zeros(num_findings))
 
     def _apply_slot_dropout(self, present: torch.Tensor) -> torch.Tensor:
-        """Randomly drop present slots during training, restoring original slots if all get dropped.
-
-        Args:
-            present: Boolean tensor of active sequences of shape (B, S).
-
-        Returns:
-            Stochastically masked boolean tensor of shape (B, S).
-        """
         if not self.training or self.slot_dropout_p <= 0.0:
             return present
         keep_mask = torch.rand_like(present, dtype=torch.float32) >= self.slot_dropout_p
         dropped = present & keep_mask
-        # Guarantee at least one slot remains active per study if originally present
         return torch.where(dropped.any(dim=-1, keepdim=True), dropped, present)
 
     def _forward_backbone(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward ViT backbone with non-reentrant gradient checkpointing.
-
-        Uses non-reentrant checkpointing during training so downstream unfrozen blocks
-        receive valid gradients even when inputs originate from frozen blocks.
-        Delegates directly to self.backbone(x) when checkpointing is not active.
-        """
         ckpt = self.use_grad_checkpointing and self.training and torch.is_grad_enabled()
         if not ckpt:
             return self.backbone(x)
@@ -172,7 +127,7 @@ class DINOv2SlotHead(nn.Module):
         for blk in bb.blocks:
             x = checkpoint(blk, x, use_reentrant=False)
         x = bb.norm(x)
-        return x[:, 0]  # CLS token representation (D=384)
+        return x[:, 0]
 
     def _forward_backbone_and_head(
         self,
@@ -180,65 +135,77 @@ class DINOv2SlotHead(nn.Module):
         presence_mask: torch.Tensor,
         need_weights: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        b, s, c, h, w = x.shape
-        present = presence_mask.bool()
-
-        # Slot dropout during training
-        if self.training and self.slot_dropout_p > 0.0:
-            present = self._apply_slot_dropout(present)
-
-        # Step 1: Gather and forward ONLY present slots through the ViT backbone
-        feats = x.new_zeros(b, s, self.embed_dim, dtype=torch.float32)
-        if present.any():
-            feats[present] = self._forward_backbone(x[present]).float()
+        b = x.shape[0]
+        if x.ndim == 5:
+            if x.shape[1] != NUM_SLOTS or x.shape[2] != 9:
+                raise RuntimeError(f"Expected (B, {NUM_SLOTS}, 9, H, W), got {tuple(x.shape)}")
+        elif x.ndim == 6:
+            if tuple(x.shape[1:4]) != (NUM_SLOTS, NUM_ZONES, 3):
+                raise RuntimeError(f"Expected (B, {NUM_SLOTS}, {NUM_ZONES}, 3, H, W), got {tuple(x.shape)}")
         else:
-            # DDP parameter synchronization guard: if entire batch is absent,
-            # run a dummy slice through backbone so parameters always receive gradients
-            dummy = self._forward_backbone(x.new_zeros(1, c, h, w)).float()
-            feats = feats + 0.0 * dummy.sum()
+            raise RuntimeError(f"Unsupported input rank {x.ndim}")
 
-        # Step 2: Unconditional FP32 SlotHead Execution (branch-free, zero GPU sync)
+        h_, w_ = x.shape[-2], x.shape[-1]
+        x_18 = x.reshape(b, TOTAL_TOKENS, 3, h_, w_)
+
+        presence = presence_mask.to(x.device).float()
+        active = presence.unsqueeze(2).expand(b, NUM_SLOTS, NUM_ZONES).reshape(b, TOTAL_TOKENS).clone()
+
+        if self.training and self.slot_dropout_p > 0.0:
+            present_b = presence > 0.5
+            kept_slots = self._apply_slot_dropout(present_b)
+            keep = kept_slots.float().unsqueeze(2).expand(b, NUM_SLOTS, NUM_ZONES).reshape(b, TOTAL_TOKENS)
+            active = active * keep
+
+        act_flat = active.reshape(-1) > 0.5
+        token_feats = torch.zeros(b * TOTAL_TOKENS, self.embed_dim, device=x.device, dtype=torch.float32)
+
+        if act_flat.any():
+            feats = self._forward_backbone(x_18.reshape(b * TOTAL_TOKENS, 3, h_, w_)[act_flat])
+            token_feats[act_flat] = feats.float()
+        else:
+            dummy = self._forward_backbone(x.new_zeros(1, 3, h_, w_)).float()
+            token_feats = token_feats + 0.0 * dummy.sum()
+
+        tokens = token_feats.view(b, TOTAL_TOKENS, self.embed_dim)
+
+        slot_idx = torch.arange(NUM_SLOTS, device=x.device).repeat_interleave(NUM_ZONES)
+        zone_idx = torch.arange(NUM_ZONES, device=x.device).repeat(NUM_SLOTS)
+        tokens = tokens + (self.slot_embed[slot_idx] + self.zone_embed[zone_idx]).unsqueeze(0)
+
+        key_padding_mask = active <= 0.5
+        all_masked = key_padding_mask.all(dim=1)
+        if all_masked.any():
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[all_masked] = False
+
+        q = self.finding_queries.unsqueeze(0).expand(b, -1, -1)
         with torch.autocast(device_type=x.device.type, enabled=False):
-            # Inject slot identity embeddings and gate absent tokens
-            tokens = (feats + self.slot_embed.unsqueeze(0)) * present.unsqueeze(-1).float()
-
-            key_padding_mask = ~present
-            all_absent = key_padding_mask.all(dim=-1, keepdim=True)
-            safe_key_padding_mask = key_padding_mask & ~all_absent
-
-            queries = self.finding_queries.unsqueeze(0).expand(b, -1, -1)
-            attended, attn_weights = self.cross_attn(
-                query=queries,
-                key=tokens,
-                value=tokens,
-                key_padding_mask=safe_key_padding_mask,
+            attn_out, attn_w = self.cross_attn(
+                q.float(),
+                tokens.float(),
+                tokens.float(),
+                key_padding_mask=key_padding_mask,
                 need_weights=need_weights,
+                average_attn_weights=False,
             )
-
-            attended = self.norm(queries + attended)
-            attended = self.pre_cls_dropout(attended)
-            logits = (attended * self.cls_w).sum(dim=-1) + self.cls_b
+            a = self.norm(q + attn_out)
+            a = self.pre_cls_dropout(a)
+            logits = (a * self.cls_w.unsqueeze(0)).sum(dim=-1) + self.cls_b.unsqueeze(0)
+            logits = logits.float()
 
         clean_weights = None
-        if need_weights and attn_weights is not None:
+        if need_weights and attn_w is not None:
+            clean_weights = attn_w.mean(dim=1)
             clean_weights = torch.where(
-                present.unsqueeze(1),
-                attn_weights,
-                torch.zeros_like(attn_weights),
+                active.unsqueeze(1) > 0.5,
+                clean_weights,
+                torch.zeros_like(clean_weights),
             )
 
         return logits, clean_weights
 
     def forward(self, x: torch.Tensor, presence_mask: torch.Tensor) -> torch.Tensor:
-        """Standard model forward pass returning strictly raw logits of shape (B, 12).
-
-        Args:
-            x: Input batch tensor of shape (B, 6, 3, H, W).
-            presence_mask: Binary mask of active slots of shape (B, 6).
-
-        Returns:
-            Raw unscaled logits tensor of shape (B, 12) in FP32.
-        """
         logits, _ = self._forward_backbone_and_head(x, presence_mask, need_weights=False)
         return logits
 
@@ -247,17 +214,4 @@ class DINOv2SlotHead(nn.Module):
         x: torch.Tensor,
         presence_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Diagnostic forward pass returning raw logits and head-averaged attention weights.
-
-        Args:
-            x: Input batch tensor of shape (B, 6, 3, H, W).
-            presence_mask: Binary mask of active slots of shape (B, 6).
-
-        Returns:
-            Tuple of:
-                logits: Raw unscaled logits of shape (B, 12).
-                attn_weights: Head-averaged slot attention weights of shape (B, 12, 6).
-        """
-        logits, attn_weights = self._forward_backbone_and_head(x, presence_mask, need_weights=True)
-        assert attn_weights is not None
-        return logits, attn_weights
+        return self._forward_backbone_and_head(x, presence_mask, need_weights=True)

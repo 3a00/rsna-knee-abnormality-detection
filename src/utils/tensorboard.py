@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import re
 from pathlib import Path
 import sys
@@ -68,15 +69,19 @@ def sanitize_tag(tag: str) -> str:
 def compute_conditional_slot_attention(
     matrix: np.ndarray,
     presence_mask: np.ndarray | None = None,
+    num_slots: int = 6,
 ) -> np.ndarray:
     """Compute conditional mean slot attention E[attn | present].
 
+    If matrix has shape (B, 12, 18), sums attention across the 3 depth zones per slot
+    to produce the canonical (12, 6) slot attention matrix.
     Prevents penalizing rarely present sequences (e.g. COR_T1, SAG_T1)
     with zeros from absent studies.
 
     Args:
-        matrix: Attention weights of shape (B, 12, 6) or (12, 6).
+        matrix: Attention weights of shape (B, 12, T), (B, 12, 6), or (12, 6).
         presence_mask: Optional binary presence mask of shape (B, 6).
+        num_slots: Number of canonical slots (default: 6).
 
     Returns:
         Conditional attention matrix of shape (12, 6).
@@ -85,6 +90,10 @@ def compute_conditional_slot_attention(
         return matrix
     if matrix.ndim != 3:
         raise ValueError(f"Expected 2D or 3D attention matrix, got shape {matrix.shape}")
+
+    b, f, t = matrix.shape
+    if t != num_slots:
+        matrix = matrix.reshape(b, f, num_slots, t // num_slots).sum(axis=-1)
 
     if presence_mask is not None:
         p_expanded = np.expand_dims(presence_mask.astype(np.float32), 1)

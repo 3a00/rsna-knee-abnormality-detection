@@ -78,7 +78,7 @@ The 5-slice dataset tests in `tests/test_caching_and_regularization.py` (`test_d
 
 ## Tasks
 
-- [ ] **3-Zone Compartment-Anchored Slice Sampling (`src/datasets/efficiency_pipeline.py`)**:
+- [x] **3-Zone Compartment-Anchored Slice Sampling (`src/datasets/efficiency_pipeline.py`)**:
   - Implement `select_multizone_slice_paths(headers, num_zones=3)`:
     - Sort deduplicated headers along normal projection vector $k = \vec{p} \cdot (\vec{r} \times \vec{c})$.
     - Check median slice spacing $\Delta k$: if $\Delta k < 1.5$ mm (thin-slice 3D series), select physical slices at $\pm 3.0$ mm around zone centers. Otherwise select index offsets $[c_z - 1, c_z, c_z + 1]$.
@@ -88,14 +88,14 @@ The 5-slice dataset tests in `tests/test_caching_and_regularization.py` (`test_d
     - Output study tensor of shape `(6, 9, 336, 336)` float16 and binary presence mask `(6,)`.
   - Update `normalize_volume_dinov2` to handle $K=9$ volumes.
   - Update `verify_cache` to strictly require `.npz` format, validate `format` key, `n_slices_cached: 9`, and `sampling_strategy: "3zone"`.
-- [ ] **Dedicated 9-Slice Offline Pre-Caching Pipeline (`scripts/preprocess_336px_cache.py`)**:
+- [x] **Dedicated 9-Slice Offline Pre-Caching Pipeline (`scripts/preprocess_336px_cache.py`)**:
   - Update pre-caching script to extract and persist 9 slices per slot into compressed `.npz` archives.
   - Default `--cache-dir` to `/kaggle/tmp/rsna_cache_336_9slice`.
   - Update `cache_manifest.json` schema: `"format": "npz"`, `"n_slices_cached": 9`, `"sampling_strategy": "3zone"`.
   - Update resume logic to verify existing `.npz` shape is `(6, 9)`.
   - Update QC montage to select zone 1 centre slice (index 4).
   - Restore `--benchmark` CLI flag and `benchmark_loader_throughput`.
-- [ ] **18-Token Multi-Zone DINOv2-Small SlotHead (`src/models/dinov2_slothead.py`)**:
+- [x] **18-Token Multi-Zone DINOv2-Small SlotHead (`src/models/dinov2_slothead.py`)**:
   - Add learnable depth zone embeddings `self.zone_embed = nn.Parameter(torch.randn(3, embed_dim) * 0.20)`.
   - Reshape input `x` of shape `(B, 6, 9, H, W)` into 18 triplets `(B, 6, 3, 3, H, W)`.
   - Forward active slot-zone triplets through shared DINOv2-Small backbone under non-reentrant gradient checkpointing.
@@ -106,11 +106,11 @@ The 5-slice dataset tests in `tests/test_caching_and_regularization.py` (`test_d
   - Default `num_heads` to 6.
   - Cross-attention queries $\mathbf{Q} \in \mathbb{R}^{12 \times D}$ attend across all 18 tokens, returning raw logits of shape `(B, 12)`.
   - Preserve `forward_with_attention` returning `(logits, attn_weights)`.
-- [ ] **Normalized Task-Level Loss Reweighting (`src/training/losses.py`)**:
+- [x] **Normalized Task-Level Loss Reweighting (`src/training/losses.py`)**:
   - Add `compute_task_weights(target_boost: float = 1.75, boost_indices=(2, 3, 5, 6))` returning normalized weights with mean 1.0 ($1.40\times$ for the 4 boosted targets, $0.80\times$ for remaining 8).
   - Add `task_weights: torch.Tensor | None = None` parameter of shape `(12,)` to `MaskedBCEWithLogitsLoss`. Preserves `gold_weight: float = 2.0` class default and `continuous_pos_weight: bool = True`.
   - Multiply unreduced BCE loss by `task_weights` buffer placed on compute device alongside `sample_weights` and continuous `pos_weight`.
-- [ ] **DDP Training Engine & CLI Wiring (`src/training/train_efficiency.py` & `scripts/train_ddp_efficiency.py`)**:
+- [x] **DDP Training Engine & CLI Wiring (`src/training/train_efficiency.py` & `scripts/train_ddp_efficiency.py`)**:
   - In `EfficiencyStudyDataset`, require mandatory 9-slice `.npz` cache and fail fast on missing manifest, shape mismatch, or missing files. Default `self.transform` to `apply_msk_augmentations` when `is_train=True`.
   - Full MSK augmentations: per-slot affine (rot $\pm 7^\circ$, scale $0.93\text{--}1.07$, translate $\pm 4\%$), corner-median background fill, and global contrast $\pm 10\%$.
   - Synovitis imputation: `impute_soft_synovitis` fills both `isna()` and pre-binarized `(Synovitis == 0.0) & synovitis_soft.between(0.001, 0.999)` for non-gold studies (3,540 studies), preserving gold hard labels. Runtime guard verifies `n_imputed > 0 or n_frac > 0`.
@@ -124,12 +124,12 @@ The 5-slice dataset tests in `tests/test_caching_and_regularization.py` (`test_d
     - Set `--gold-weight None` by default, resolving to `config.yaml` (`training.gold_weight`).
     - Seed hygiene: `seed_everything` before model initialization, followed by per-rank seed.
     - Robust label merge with `validate="one_to_one"` and count assertion.
-- [ ] **Telemetry Suite (`src/utils/tensorboard.py`)**:
+- [x] **Telemetry Suite (`src/utils/tensorboard.py`)**:
   - Add `import math` to prevent `NameError` in `log_scalar`.
   - Update `compute_conditional_slot_attention` to aggregate 18 tokens into 12×6 slot attention matrix (`matrix.reshape(b, f, num_slots, t // num_slots).sum(axis=-1)`).
-- [ ] **Timing Benchmark Script (`scripts/scratch_time_inference.py`)**:
+- [x] **Timing Benchmark Script (`scripts/scratch_time_inference.py`)**:
   - Implement single-GPU 100-study timing benchmark evaluating DICOM decoding + forward pass with untimed warm-up and FP16 autocast, reporting dual projections against 15-minute budget.
-- [ ] **Comprehensive Unit Test Suite (`tests/test_multizone_sampling.py`)**:
+- [x] **Comprehensive Unit Test Suite (`tests/test_multizone_sampling.py`)**:
   - Test `test_select_multizone_slice_paths_spacing_and_anchors` ($N=25$ hardcoded [6, 12, 18], thin 3D $\pm 3.0$ mm spacing [54, 60, 66]).
   - Test `test_all_absent_study_produces_finite_logits`.
   - Test `test_head_incl_zone_embed_trains_from_stage1_and_all_at_stage4` (verifies `zone_embed` trains under `set_stage_trainable`).

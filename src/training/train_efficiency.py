@@ -35,6 +35,7 @@ import yaml
 
 from src.datasets.efficiency_pipeline import (
     DEFAULT_CROP_MM,
+    NUM_SLOTS,
     SLOT_NAMES,
     Fast6SlotDICOMDataset,
     load_series_metadata,
@@ -53,12 +54,7 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
-def seed_everything(seed: int) -> None:
-    """Set random seeds across Python, NumPy, PyTorch CPU and CUDA for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+from src.utils.seed import seed_everything  # Re-exported for backward compatibility
 
 
 def _seed_worker(worker_id: int, base_seed: int) -> None:
@@ -79,205 +75,104 @@ def load_pos_weights(config_path: str | Path | None = None) -> list[float]:
     return [float(x) for x in weights]
 
 
-def apply_msk_augmentations(img: torch.Tensor, presence_mask: torch.Tensor) -> torch.Tensor:
-    """Per-slot spatial and photometric augmentations for knee MRI.
-
-    Guarantees:
-      1. Strictly prohibits horizontal and vertical reflections (no flips).
-      2. Applies independent spatial affine per slot, shared across its 3 channels.
-      3. Uses InterpolationMode.BILINEAR to prevent aliased jagged artifacts.
-      4. Samples dynamic corner median per present slot for fill=[bg] to match real image background.
-      5. Absent slots (presence_mask[i] == 0) are strictly skipped and remain exactly 0.0.
-      6. Isotropic Gaussian blur: samples a single scalar sigma ~ U(0.5, 1.0) and passes [s, s].
-    """
-    s, c, h, w = img.shape
-    out = img.float().clone()
-    max_t = 0.04 * w
-
-    for i in range(s):
-        if presence_mask[i] == 0:
+def apply_msk_augmentations(tensor: torch.Tensor, presence_mask: torch.Tensor, p_slot_drop: float = 0.0) -> torch.Tensor:
+    """Per-slot affine (rot +/-7 deg, scale 0.93-1.07, translate +/-4%), shared by all K slices of a slot.
+    No flips. Background filled with the slot's corner median. Global contrast +/-10%."""
+    out = tensor.clone()
+    num_slots, _, h, w = out.shape
+    if random.random() < 0.5:
+        out = out * (1.0 + random.uniform(-0.10, 0.10))
+    for s in range(num_slots):
+        if presence_mask[s] <= 0:
             continue
-
-        x_i = out[i]
-        corners = torch.cat([
-            x_i[:, :16, :16].flatten(),
-            x_i[:, :16, -16:].flatten(),
-            x_i[:, -16:, :16].flatten(),
-            x_i[:, -16:, -16:].flatten(),
-        ])
-        bg = float(corners.median())
-
-        x = TF.affine(
-            x_i,
+        slot = out[s]
+        ps = 8
+        fill = float(torch.cat([slot[:, :ps, :ps].flatten(), slot[:, :ps, -ps:].flatten(),
+                                slot[:, -ps:, :ps].flatten(), slot[:, -ps:, -ps:].flatten()]).median())
+        tx = int(round(random.uniform(-0.04, 0.04) * w))
+        ty = int(round(random.uniform(-0.04, 0.04) * h))
+        out[s] = TF.affine(
+            slot - fill,
             angle=random.uniform(-7.0, 7.0),
-            translate=[int(round(random.uniform(-max_t, max_t))) for _ in range(2)],
+            translate=[tx, ty],
             scale=random.uniform(0.93, 1.07),
             shear=[0.0, 0.0],
             interpolation=InterpolationMode.BILINEAR,
-            fill=[bg],
-        )
-
-        if random.random() < 0.5:
-            x = x * random.uniform(0.90, 1.10) + random.uniform(-0.10, 0.10)
-
-        if random.random() < 0.2:
-            if random.random() < 0.5:
-                x = x + torch.randn_like(x) * 0.02
-            else:
-                sg = random.uniform(0.5, 1.0)
-                x = TF.gaussian_blur(x, kernel_size=[3, 3], sigma=[sg, sg])
-
-        out[i] = x
-
-    return out.to(img.dtype)
+        ) + fill
+    return out
 
 
 class EfficiencyStudyDataset(Dataset):
-    """6-Slot dataset wrapping fast selective DICOM decoding with cache provenance & jitter.
-
-    Defaults safely to is_train=False to prevent accidental stochastic jitter during eval/inference.
-    """
+    """PyTorch Dataset loading 6-slot studies from 9-slice pre-cached .npz archives."""
 
     def __init__(
         self,
         study_uids: Sequence[str],
-        study_dirs: Sequence[str | Path],
-        labels: np.ndarray | None = None,
-        is_gold: np.ndarray | None = None,
-        series_csv_path: str | Path | None = None,
+        study_dirs: Sequence[str | Path] | None = None,
+        labels: Optional[np.ndarray | Sequence[Sequence[float]]] = None,
+        is_gold: Optional[np.ndarray | Sequence[float]] = None,
+        series_csv_path: Optional[str | Path] = None,
+        num_workers: int = 0,
         target_size: int = 336,
         crop_mm: float = DEFAULT_CROP_MM,
-        cached_tensor_dir: str | Path | None = None,
-        num_workers: int = 0,
-        is_train: bool = False,       # Safe default: opt-in during training
-        require_cache: bool = False,  # Fail fast if cache file missing
+        cached_tensor_dir: Optional[str | Path] = None,
+        transform: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+        is_train: bool = False,
+        require_cache: bool = True,
     ) -> None:
         self.study_uids = [str(u) for u in study_uids]
-        self.study_dirs = [Path(d) for d in study_dirs]
-        self.labels = np.asarray(labels, dtype=np.float32) if labels is not None else None
-        self.is_gold = np.asarray(is_gold, dtype=np.int64) if is_gold is not None else None
-        self.series_csv_path = series_csv_path
-        self._series_meta = load_series_metadata(series_csv_path) if series_csv_path else None
+        self.labels = np.array(labels, dtype=np.float32) if labels is not None else None
+        self.is_gold = np.array(is_gold, dtype=np.float32) if is_gold is not None else None
         self.target_size = target_size
         self.crop_mm = crop_mm
-        self.cached_dir = Path(cached_tensor_dir) if cached_tensor_dir else None
-        self.num_workers = num_workers
+        self.transform = transform if transform is not None else (apply_msk_augmentations if is_train else None)
         self.is_train = is_train
-        self.require_cache = require_cache
-        self._dicom_ds: Fast6SlotDICOMDataset | None = None
 
-        if self.cached_dir is not None:
-            manifest_file = self.cached_dir / "cache_manifest.json"
-            if manifest_file.is_file():
-                with open(manifest_file, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                if (
-                    int(meta.get("target_size", self.target_size)) != self.target_size
-                    or abs(float(meta.get("crop_mm", self.crop_mm)) - self.crop_mm) > 1e-4
-                    or int(meta.get("n_slices_cached", 5)) != 5
-                ):
-                    raise RuntimeError(f"Stale cache manifest in {self.cached_dir}: {meta}")
+        if cached_tensor_dir is None:
+            raise ValueError("EfficiencyStudyDataset requires mandatory cached_tensor_dir")
 
-    def _get_dicom_ds(self) -> Fast6SlotDICOMDataset:
-        if self._dicom_ds is None:
-            self._dicom_ds = Fast6SlotDICOMDataset(
-                study_dirs=self.study_dirs,
-                labels=self.labels,
-                series_csv_path=self.series_csv_path,
-                num_workers=0,
-                target_size=self.target_size,
-                crop_mm=self.crop_mm,
-            )
-        return self._dicom_ds
+        self.cached_dir = Path(cached_tensor_dir)
+        manifest_p = self.cached_dir / "cache_manifest.json"
+        if not manifest_p.is_file():
+            raise FileNotFoundError(f"Missing cache manifest at {manifest_p}. Run preprocess_336px_cache.py first.")
+
+        with open(manifest_p, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        if int(meta.get("n_slices_cached", -1)) != 9 or meta.get("sampling_strategy") != "3zone" or meta.get("format") != "npz":
+            raise RuntimeError(f"Cache in {self.cached_dir} does not meet 9-slice 3zone npz contract: {meta}")
 
     def __len__(self) -> int:
         return len(self.study_uids)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         uid = self.study_uids[idx]
+        archive_path = self.cached_dir / f"{uid}.npz"
+        if not archive_path.is_file():
+            raise FileNotFoundError(f"Missing cached study archive: {archive_path}")
 
-        # Fast-path: pre-extracted cached tensor
-        if self.cached_dir is not None:
-            npz_file = self.cached_dir / f"{uid}.npz"
-            pt_file = self.cached_dir / f"{uid}.pt"
+        with open(archive_path, "rb") as fp:
+            data = np.load(fp)
+            img = torch.from_numpy(data["image"])
+            mask = torch.from_numpy(data["presence_mask"]).float()
 
-            if npz_file.is_file():
-                with open(npz_file, "rb") as fp:
-                    data = np.load(fp)
-                    img = torch.from_numpy(data["image"])
-                    mask = torch.from_numpy(data["presence_mask"]).float()
-            elif pt_file.is_file():
-                cached = torch.load(pt_file, map_location="cpu", weights_only=True)
-                if isinstance(cached, dict):
-                    meta = cached.get("meta")
-                    if meta is not None:
-                        cached_sz = int(meta.get("target_size", meta.get("size", self.target_size)))
-                        cached_crop = float(meta.get("crop_mm", self.crop_mm))
-                        if cached_sz != self.target_size or abs(cached_crop - self.crop_mm) > 1e-4:
-                            raise RuntimeError(f"Stale cache for {uid}: cached {meta}")
-                    img = cached["image"]
-                    mask = cached["presence_mask"].float()
-                else:
-                    img, mask = cached[0], cached[1].float()
-            elif self.require_cache:
-                raise FileNotFoundError(f"Missing cache file for study {uid} in {self.cached_dir}")
-            else:
-                img = mask = None
+        if img.shape[0] != NUM_SLOTS or img.shape[1] != 9:
+            raise RuntimeError(f"Cache array shape mismatch for {uid}: expected (6, 9, H, W), got {tuple(img.shape)}")
 
-            if img is not None and mask is not None:
-                # Slice first, then convert to float to minimize memory copies
-                if img.shape[1] == 5:
-                    if self.is_train:
-                        offset = random.randint(0, 2)
-                        img = img[:, offset : offset + 3].contiguous().float()
-                    else:
-                        img = img[:, 1:4].contiguous().float()
-                elif img.shape[1] == 3:
-                    img = img.contiguous().float()
-                else:
-                    raise RuntimeError(f"Unexpected slice dimension: {img.shape[1]}")
+        img = img.float()
 
-                if self.is_train:
-                    img = apply_msk_augmentations(img, mask.float())
+        if self.is_train and self.transform is not None:
+            img = self.transform(img, mask)
 
-                item: dict[str, Any] = {
-                    "study_id": uid,
-                    "image": img,
-                    "presence_mask": mask.float(),
-                }
-                if self.labels is not None:
-                    item["labels"] = torch.from_numpy(self.labels[idx])
-                item["is_gold"] = torch.tensor(self.is_gold[idx] if self.is_gold is not None else 0, dtype=torch.long)
-                return item
-
-        # Normalization Parity Fallback: decode 5 slices with series_metadata and slice [1:4]
-        study_dir = self.study_dirs[idx]
-        img_5, mask = process_study_to_5slice_cache(
-            study_dir=study_dir,
-            series_metadata=self._series_meta,
-            target_size=self.target_size,
-            crop_mm=self.crop_mm,
-            slice_pos=0.5,
-        )
-
-        if self.is_train:
-            offset = random.randint(0, 2)
-            img = img_5[:, offset : offset + 3].contiguous().float()
-            img = apply_msk_augmentations(img, mask.float())
-        else:
-            img = img_5[:, 1:4].contiguous().float()
-
-        item = {
+        item: dict[str, Any] = {
             "study_id": uid,
             "image": img,
-            "presence_mask": mask.float(),
+            "presence_mask": mask,
         }
         if self.labels is not None:
             item["labels"] = torch.from_numpy(self.labels[idx])
         if self.is_gold is not None:
-            item["is_gold"] = torch.tensor(self.is_gold[idx], dtype=torch.long)
-        else:
-            item["is_gold"] = torch.tensor(0, dtype=torch.long)
+            item["is_gold"] = torch.tensor(self.is_gold[idx], dtype=torch.float32)
         return item
 
 
@@ -426,7 +321,7 @@ def _is_no_decay(name: str, p: torch.Tensor) -> bool:
         or "norm" in name
         or "pos_embed" in name
         or "cls_token" in name
-        or any(t in name for t in ("slot_embed", "finding_queries"))
+        or any(t in name for t in ("slot_embed", "zone_embed", "finding_queries"))
     )
 
 
@@ -438,8 +333,14 @@ def build_differential_optimizer(
     lr_top2: float = 2e-5,
     lr_head: float = 1e-3,
     weight_decay: float = 0.05,
+    lr_middle: float | None = None,
+    lr_top: float | None = None,
 ) -> torch.optim.AdamW:
     """Build AdamW optimizer with 4-tier layer-wise learning rate decay (LLRD) across 10 parameter groups."""
+    lr_mid = lr_middle if lr_middle is not None else lr_mid
+    lr_top1 = lr_top if lr_top is not None else lr_top1
+    lr_top2 = lr_top if lr_top is not None else lr_top2
+
     rates = {
         "bb_bot": lr_bottom,
         "bb_mid": lr_mid,
@@ -454,7 +355,8 @@ def build_differential_optimizer(
         for suffix in ("decay", "nodecay")
     }
 
-    for name, p in model.named_parameters():
+    unwrapped = getattr(model, "module", model)
+    for name, p in unwrapped.named_parameters():
         fam = _param_family(name)
         suffix = "nodecay" if _is_no_decay(name, p) else "decay"
         groups[f"{fam}_{suffix}"].append(p)
@@ -465,54 +367,29 @@ def build_differential_optimizer(
             "lr": rates[fam],
             "weight_decay": 0.0 if suffix == "nodecay" else weight_decay,
             "name": f"{fam}_{suffix}",
+            "family": fam,
         }
         for fam in ("bb_bot", "bb_mid", "bb_top1", "bb_top2", "head")
         for suffix in ("decay", "nodecay")
     ]
+    covered = {id(p) for g in param_groups for p in g["params"]}
+    missing = [n for n, p in unwrapped.named_parameters() if p.requires_grad and id(p) not in covered]
+    assert not missing, f"Parameters missing from optimizer groups: {missing[:5]}"
     return torch.optim.AdamW(param_groups)
 
 
-def impute_soft_synovitis(train_df: pd.DataFrame, label_cols: Sequence[str]) -> int:
-    """Impute continuous soft weak labels for silent non-gold Synovitis rows per ADR-0001.
-
-    Fails fast if required columns are absent or if zero silent rows were updated.
-
-    Returns:
-        Number of studies updated.
-    """
-    if "Synovitis" not in label_cols:
-        return 0
-    if "is_gold" not in train_df.columns:
-        raise KeyError("Missing required 'is_gold' column in train labels DataFrame.")
-    if "synovitis_soft" not in train_df.columns:
-        raise KeyError("Missing required 'synovitis_soft' column in train labels DataFrame.")
-
-    non_gold_mask = train_df["is_gold"] == 0
-
-    # In raw extracted labels, silence is marked by NaN or -1.
-    # In pre-binarized tables (e.g. pseudo_labels.csv), silence was mapped to 0.0
-    # while synovitis_soft preserves continuous probabilities (0.22 / 0.63).
-    is_silent = train_df["Synovitis"].isna() | (train_df["Synovitis"] == -1)
-    if not is_silent.any():
-        is_silent = (train_df["Synovitis"] == 0.0) & (train_df["synovitis_soft"] > 0) & (train_df["synovitis_soft"] < 1)
-
-    impute_mask = non_gold_mask & is_silent & train_df["synovitis_soft"].notna()
-    n_imputed = int(impute_mask.sum())
-
-    already_imputed = int((non_gold_mask & (train_df["Synovitis"] > 0) & (train_df["Synovitis"] < 1)).sum())
-    if n_imputed == 0 and already_imputed > 0:
-        return already_imputed
-
-    if is_silent.any() and n_imputed == 0:
-        raise RuntimeError(
-            "Silent non-gold rows exist in Synovitis, but zero were imputed with synovitis_soft. "
-            "Verify that synovitis_soft column contains valid continuous probabilities."
-        )
-
-    if n_imputed > 0:
-        train_df.loc[impute_mask, "Synovitis"] = train_df.loc[impute_mask, "synovitis_soft"].astype(float)
-
-    return n_imputed
+def impute_soft_synovitis(df: pd.DataFrame, label_cols: Sequence[str] | None = None) -> pd.DataFrame:
+    """Return a copy with silent non-gold Synovitis (NaN or pre-binarized 0.0) replaced by synovitis_soft."""
+    if "synovitis_soft" not in df.columns:
+        raise KeyError("Missing required 'synovitis_soft' column.")
+    out = df.copy()
+    syn, soft = out["Synovitis"], out["synovitis_soft"]
+    silent = syn.isna() | ((syn == 0.0) & soft.between(0.001, 0.999))
+    if "is_gold" in out.columns:
+        silent &= out["is_gold"].fillna(0).astype(float) == 0
+    fill = silent & soft.notna()
+    out["Synovitis"] = syn.where(~fill, soft).astype(np.float32)
+    return out
 
 
 def compute_collective_val_loss(

@@ -214,7 +214,7 @@ def test_log_graph_on_real_slothead(tmp_path: Path) -> None:
 
     tb = TensorBoardLogger(tmp_path / "g")
     m = DINOv2SlotHead(pretrained=False, img_size=336)
-    dummy_imgs = torch.zeros(1, 6, 3, 336, 336)
+    dummy_imgs = torch.zeros(1, 6, 9, 336, 336)
     dummy_masks = torch.ones(1, 6)
     ok = tb.log_graph(m, (dummy_imgs, dummy_masks))
     tb.close()

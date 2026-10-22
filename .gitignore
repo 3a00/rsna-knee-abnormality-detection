@@ -30,7 +30,7 @@ outputs/weights/*.onnx
 .DS_Store
 *.log
 
-
+outputs
 outputs/checkpoint_dataset/
 outputs/weights/
 outputs/codebase_zip/

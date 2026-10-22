@@ -1,7 +1,7 @@
 """scripts/preprocess_336px_cache.py
 
 Dedicated Offline 336px Pre-Caching Pipeline for RSNA Efficiency Track Training.
-Pre-extracts 5 centered physical slices per present slot, crops 140mm physical FOV,
+Pre-extracts 9 multi-zone physical slices per present slot (3 compartments x 3 slices), crops 140mm physical FOV,
 and persists compressed .npz archives per study with atomic file replacement.
 """
 
@@ -30,9 +30,9 @@ from src.datasets.efficiency_pipeline import (
     DEFAULT_CROP_MM,
     SLOT_NAMES,
     load_series_metadata,
-    process_study_to_5slice_cache,
+    process_study_to_9slice_cache,
 )
-from src.training.train_efficiency import seed_everything
+from src.utils.seed import seed_everything
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -67,10 +67,12 @@ def _process_single_study_npz(
         try:
             with open(out_file, "rb") as fp:
                 data = np.load(fp)
-                mask = data["presence_mask"]
-                active = [i for i, m in enumerate(mask) if m > 0]
-                is_clipped = bool(data["clipped"]) if "clipped" in data.files else False
-                return True, len(active) == 0, is_clipped, active, study_uid
+                img = data["image"]
+                if img.shape[:2] == (6, 9):
+                    mask = data["presence_mask"]
+                    active = [i for i, m in enumerate(mask) if m > 0]
+                    is_clipped = bool(data["clipped"]) if "clipped" in data.files else False
+                    return True, len(active) == 0, is_clipped, active, study_uid
         except Exception:
             pass
 
@@ -83,13 +85,12 @@ def _process_single_study_npz(
             return False, False, False, [], study_uid
 
     try:
-        res = process_study_to_5slice_cache(
+        res = process_study_to_9slice_cache(
             study_dir=study_dir,
             series_metadata=_worker_series_metadata,
             num_workers=0,
             target_size=target_size,
             crop_mm=crop_mm,
-            slice_pos=0.5,
             return_info=True,
         )
         tensor, mask, info = res  # type: ignore
@@ -128,14 +129,14 @@ def export_qc_montage(cache_dir: Path, out_path: Path, n_samples: int = 16) -> N
     for f in npz_files:
         with open(f, "rb") as fp:
             data = np.load(fp)
-            img = data["image"]  # (6, 5, H, W)
+            img = data["image"]  # (6, 9, H, W)
             mask = data["presence_mask"]
 
-        # Center slice index 2 for all 6 slots at native normalized scale [-2.5, 2.5] -> [0, 255]
+        # Center slice index 4 for all 6 slots at native normalized scale [-2.5, 2.5] -> [0, 255]
         row_slots = []
         for s in range(6):
             if mask[s] > 0:
-                sl = img[s, 2].astype(np.float32)
+                sl = img[s, 4].astype(np.float32)
                 sl_disp = np.clip((sl + 2.5) / 5.0 * 255.0, 0, 255).astype(np.uint8)
             else:
                 sl_disp = np.zeros((img.shape[2], img.shape[3]), dtype=np.uint8)
@@ -165,8 +166,8 @@ def benchmark_loader_throughput(cache_dir: Path, study_uids: list[str], n_trials
             data = np.load(fp)
             img = torch.from_numpy(data["image"])
             mask = torch.from_numpy(data["presence_mask"]).float()
-        # Slice first, then convert to float
-        img = img[:, 1:4].contiguous().float()
+        # Slices already 9, convert to float and augment
+        img = img.contiguous().float()
         img = apply_msk_augmentations(img, mask)
 
     elapsed = time.time() - t0
@@ -176,9 +177,9 @@ def benchmark_loader_throughput(cache_dir: Path, study_uids: list[str], n_trials
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Preprocess and cache 336px 5-slice MRI studies into compressed .npz")
+    parser = argparse.ArgumentParser(description="Preprocess and cache 336px 9-slice MRI studies into compressed .npz")
     parser.add_argument("--dicom-root", type=str, required=True)
-    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache_336_140mm")
+    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache_336_9slice")
     parser.add_argument("--series-csv", type=str, default=None)
     parser.add_argument("--splits-csv", type=str, required=True)
     parser.add_argument("--target-size", type=int, default=336)
@@ -193,7 +194,7 @@ def main() -> None:
     seed_everything(42)
 
     # Route pilot run into dedicated directory to prevent poisoning full cache
-    if args.limit and args.cache_dir == "/kaggle/tmp/rsna_cache_336_140mm":
+    if args.limit and args.cache_dir == "/kaggle/tmp/rsna_cache_336_9slice":
         args.cache_dir = "/kaggle/tmp/rsna_cache_pilot"
         logger.info("Pilot mode: routing cache to %s", args.cache_dir)
 
@@ -215,6 +216,8 @@ def main() -> None:
             existing.get("target_size") != args.target_size
             or abs(float(existing.get("crop_mm", 0.0)) - args.crop_mm) > 1e-4
             or existing.get("format") != "npz"
+            or existing.get("n_slices_cached") != 9
+            or existing.get("sampling_strategy") != "3zone"
         ):
             raise RuntimeError(
                 f"Conflicting cache found at {cache_dir}: {existing}. "
@@ -236,7 +239,8 @@ def main() -> None:
     manifest_data = {
         "target_size": args.target_size,
         "crop_mm": float(args.crop_mm),
-        "n_slices_cached": 5,
+        "n_slices_cached": 9,
+        "sampling_strategy": "3zone",
         "format": "npz",
         "in_progress": True,
         "start_time": time.time(),

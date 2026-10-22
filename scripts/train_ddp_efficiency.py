@@ -1,3 +1,4 @@
+# filepath: scripts/train_ddp_efficiency.py
 """scripts/train_ddp_efficiency.py
 
 Dual-GPU DistributedDataParallel (DDP) Multi-Fold Training Engine for RSNA Efficiency Track.
@@ -19,7 +20,9 @@ import math
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, Sequence
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -41,8 +44,9 @@ from src.datasets.efficiency_pipeline import DEFAULT_CROP_MM, verify_cache
 from src.models.dinov2_slothead import DINOv2SlotHead
 from src.training.ddp import advance_stage, rewrap_ddp, set_stage_trainable
 apply_unfreezing_stage = set_stage_trainable
-from src.training.losses import MaskedBCEWithLogitsLoss
+from src.training.losses import MaskedBCEWithLogitsLoss, compute_task_weights
 from src.training.metrics import compute_competition_metrics, load_label_columns
+from src.utils.seed import seed_everything
 from src.training.train_efficiency import (
     STAGE4_LR_PEAKS,
     EfficiencyStudyDataset,
@@ -50,7 +54,6 @@ from src.training.train_efficiency import (
     compute_collective_val_loss,
     impute_soft_synovitis,
     load_pos_weights,
-    seed_everything,
     stage_for_epoch,
     stage4_start_for,
 )
@@ -74,6 +77,29 @@ def atomic_json(obj: Any, path: Path) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def resolve_gold_weight(args: argparse.Namespace) -> float:
+    """Resolve gold_weight from CLI argument or fall back to config.yaml."""
+    if getattr(args, "gold_weight", None) is not None:
+        return float(args.gold_weight)
+    with open(args.config_path, "r", encoding="utf-8") as f:
+        return float(yaml.safe_load(f)["training"]["gold_weight"])
+
+
+def build_criterion(
+    args: argparse.Namespace,
+    pos_weights: torch.Tensor,
+    device: torch.device,
+) -> MaskedBCEWithLogitsLoss:
+    """Construct task-reweighted MaskedBCEWithLogitsLoss matching args and target boost."""
+    task_w = compute_task_weights(target_boost=args.target_label_boost).to(device)
+    return MaskedBCEWithLogitsLoss(
+        gold_weight=args.gold_weight,
+        pos_weight=pos_weights,
+        continuous_pos_weight=True,
+        task_weights=task_w,
+    )
 
 
 def build_fold_model(
@@ -169,6 +195,7 @@ def evaluate_dataset_collective(
     is_rank0: bool,
     use_amp: bool = True,
     criterion: nn.Module | None = None,
+    tolerate_nan: bool = False,
 ) -> tuple[float, float, float, int, float, list[dict[str, Any]]]:
     """Run rank-sharded validation and compute macro AUC & true GPU-safe BCE loss on rank 0."""
     ddp_model.eval()
@@ -196,14 +223,22 @@ def evaluate_dataset_collective(
         val_targets_np = np.array([r["targets"] for r in all_val_records])
         val_is_gold_np = np.array([r["is_gold"] for r in all_val_records])
 
-        metrics = compute_competition_metrics(
-            logits=val_logits_np,
-            targets=val_targets_np,
-            gold_mask=val_is_gold_np,
-            label_cols=label_cols,
-        )
-        score_11 = metrics.macro_auc_11
-        score_12 = metrics.macro_auc_12
+        try:
+            metrics = compute_competition_metrics(
+                logits=val_logits_np,
+                targets=val_targets_np,
+                gold_mask=val_is_gold_np,
+                label_cols=label_cols,
+            )
+            score_11 = metrics.macro_auc_11
+            score_12 = metrics.macro_auc_12
+        except (ValueError, Exception) as e:
+            if tolerate_nan:
+                logger.warning("compute_competition_metrics failed (tolerate_nan=True): %s", e)
+                score_11 = float("nan")
+                score_12 = float("nan")
+            else:
+                raise
 
         gold_mask_arr = (val_is_gold_np == 1)
         if gold_mask_arr.any():
@@ -288,12 +323,18 @@ def train_ddp_worker(
 
     splits_p = Path(args.splits_path)
     splits_df = pd.read_parquet(splits_p) if splits_p.suffix == ".parquet" else pd.read_csv(splits_p)
+    if getattr(args, "valid_uids", None) is not None:
+        splits_df = splits_df[splits_df["StudyInstanceUID"].astype(str).isin(args.valid_uids)].reset_index(drop=True)
+    if getattr(args, "limit", None) is not None and len(splits_df) > args.limit:
+        splits_df = splits_df.head(args.limit).reset_index(drop=True)
     labels_p = Path(args.labels_path)
     labels_df = pd.read_parquet(labels_p) if labels_p.suffix == ".parquet" else pd.read_csv(labels_p)
     label_cols = load_label_columns(args.config_path)
     if "is_gold" in labels_df.columns and "is_gold" in splits_df.columns:
         labels_df = labels_df.drop(columns=["is_gold"])
-    merged = splits_df.merge(labels_df, on="StudyInstanceUID", how="inner")
+    labels_df = labels_df.drop(columns=[c for c in ("fold_id", "fold") if c in labels_df.columns])
+    merged = splits_df.merge(labels_df, on="StudyInstanceUID", how="inner", validate="one_to_one")
+    assert len(merged) == len(splits_df), f"Label merge dropped {len(splits_df) - len(merged)} studies"
     if "is_gold" not in merged.columns and "is_gold_x" in merged.columns:
         merged["is_gold"] = merged["is_gold_x"]
 
@@ -352,10 +393,16 @@ def train_ddp_worker(
             train_df = train_df[~train_df["StudyInstanceUID"].astype(str).isin(args.empty_uids)].reset_index(drop=True)
 
         if args.soft_synovitis:
-            train_df = train_df.copy()
-            n_imputed = impute_soft_synovitis(train_df, label_cols)
+            before = train_df["Synovitis"].copy()
+            train_df = impute_soft_synovitis(train_df, label_cols)
+            after = train_df["Synovitis"]
+            n_imputed = int((~((after == before) | (after.isna() & before.isna()))).sum())
+            ng = train_df["is_gold"].astype(float) == 0
+            n_frac = int(((after > 0) & (after < 1) & ng).sum())
+            if n_imputed == 0 and n_frac == 0:
+                raise ValueError(f"Fold {fold_idx}: soft Synovitis imputation was a no-op.")
             if is_rank0:
-                logger.info("Fold %d: Soft weak supervision active (imputed %d silent non-gold train studies)", fold_idx, n_imputed)
+                logger.info("Fold %d: imputed %d rows, %d fractional non-gold Synovitis", fold_idx, n_imputed, n_frac)
 
         labels_mat = train_df[label_cols].values
         frac_counts = ((labels_mat > 0) & (labels_mat < 1)).sum(axis=0)
@@ -372,7 +419,6 @@ def train_ddp_worker(
             target_size=args.img_size,
             crop_mm=args.crop_mm,
             is_train=True,
-            require_cache=args.require_cache,
         )
         val_dataset = EfficiencyStudyDataset(
             study_uids=val_df["StudyInstanceUID"].tolist(),
@@ -384,7 +430,6 @@ def train_ddp_worker(
             target_size=args.img_size,
             crop_mm=args.crop_mm,
             is_train=False,
-            require_cache=args.require_cache,
         )
 
         train_sampler = DistributedSampler(
@@ -409,10 +454,9 @@ def train_ddp_worker(
             device=device,
         )
 
-        # Blocker B2 Fix: Check return status of graph tracing
         if is_rank0 and not graph_attempted:
             graph_attempted = True
-            dummy_imgs = torch.zeros(1, 6, 3, args.img_size, args.img_size, device=device)
+            dummy_imgs = torch.zeros(1, 6, 9, args.img_size, args.img_size, device=device)
             dummy_masks = torch.ones(1, 6, device=device)
             ok = tb_logger.log_graph(raw_model, (dummy_imgs, dummy_masks))
             logger.info("TensorBoard graph logged." if ok else "TensorBoard graph NOT logged (tracing failed or telemetry disabled).")
@@ -429,12 +473,11 @@ def train_ddp_worker(
             weight_decay=args.weight_decay,
         )
 
-        # Blocker B5 Fix: Guard against optimizer group name mismatches
         _EXPECTED_FAMS = {"head", "bb_top2", "bb_top1", "bb_mid", "bb_bot"}
-        _actual_fams = {g["name"].rsplit("_", 1)[0] for g in optimizer.param_groups}
+        _actual_fams = {g["family"] for g in optimizer.param_groups}
         assert _actual_fams <= _EXPECTED_FAMS, f"Unrecognised optimizer group families: {_actual_fams - _EXPECTED_FAMS}"
 
-        criterion = MaskedBCEWithLogitsLoss(gold_weight=args.gold_weight, pos_weight=pos_weights_tensor, continuous_pos_weight=True)
+        criterion = build_criterion(args, pos_weights_tensor, device)
         scaler = torch.amp.GradScaler("cuda", enabled=(args.use_amp and device.type == "cuda"))
 
         steps_per_epoch = math.ceil(len(train_loader) / max(1, args.grad_accum_steps))
@@ -474,7 +517,13 @@ def train_ddp_worker(
             epoch_loss_sum = 0.0
             step_count = 0
 
+            t_epoch0 = time.perf_counter()
+            t_prev = t_epoch0
+            data_wait = 0.0
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             for step_idx, batch in enumerate(train_loader):
+                data_wait += time.perf_counter() - t_prev
                 images = batch["image"].to(device, non_blocking=True).float()
                 masks = batch["presence_mask"].to(device, non_blocking=True)
                 targets = batch["labels"].to(device, non_blocking=True)
@@ -484,7 +533,7 @@ def train_ddp_worker(
                 sync_context = ddp_model.no_sync() if is_accumulating else contextlib.nullcontext()
 
                 for g in optimizer.param_groups:
-                    family = g["name"].rsplit("_", 1)[0]
+                    family = g["family"]
                     g["lr"] = lr_for(family, global_step, steps_per_epoch, args.epochs)
 
                 with sync_context:
@@ -509,7 +558,20 @@ def train_ddp_worker(
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
+                t_prev = time.perf_counter()
+
             logits = loss = raw_loss = None
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            if is_rank0:
+                ep_s = time.perf_counter() - t_epoch0
+                peak = torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0.0
+                logger.info(
+                    "Fold %d Ep %d Stage %d | %.3f s/micro-batch | data_wait %.1fs (%.0f%%) | peak VRAM %.2f GiB",
+                    fold_idx, epoch, stage, ep_s / max(1, step_count), data_wait,
+                    100 * data_wait / max(ep_s, 1e-9), peak,
+                )
 
             score_11, score_12, score_gold, gold_n_labels, val_loss, all_val_records = evaluate_dataset_collective(
                 ddp_model=ddp_model,
@@ -520,6 +582,7 @@ def train_ddp_worker(
                 is_rank0=is_rank0,
                 use_amp=args.use_amp,
                 criterion=criterion,
+                tolerate_nan=bool(args.limit),
             )
 
             if is_rank0:
@@ -616,6 +679,7 @@ def train_ddp_worker(
                 is_rank0=is_rank0,
                 use_amp=args.use_amp,
                 criterion=criterion,
+                tolerate_nan=bool(args.limit),
             )
             if is_rank0:
                 best_single_score = top_checkpoints[0][0] if top_checkpoints else 0.0
@@ -625,7 +689,6 @@ def train_ddp_worker(
                     recommended_path = fold_top3_path
                     atomic_json(ens_records, fold_records_path)
 
-        # Blocker B1 Fix: chosen_macro_auc_11 accurately mirrors chosen recommended_path
         if is_rank0:
             used_top3 = averaged_success and (recommended_path == fold_top3_path)
             best_single_score = float(top_checkpoints[0][0]) if top_checkpoints else None
@@ -685,17 +748,19 @@ def main() -> None:
     parser.add_argument("--folds", type=str, default=None, help="Comma-separated fold IDs to train sequentially (e.g. '0,1,2')")
     parser.add_argument("--force-retrain", action="store_true", default=False, help="Overwrite and retrain completed folds")
     parser.add_argument("--epochs", type=int, default=14)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--limit", type=int, default=None, help="Pilot smoke test study limit")
+    parser.add_argument("--target-label-boost", type=float, default=1.75, help="Multiplier for peripheral targets (2, 3, 5, 6)")
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--img-size", type=int, default=336)
     parser.add_argument("--crop-mm", type=float, default=DEFAULT_CROP_MM)
     parser.add_argument("--weight-decay", type=float, default=0.05)
-    parser.add_argument("--gold-weight", type=float, default=2.0)
+    parser.add_argument("--gold-weight", type=float, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-cache", action="store_true", default=False)
-    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache_336_140mm")
+    parser.add_argument("--cache-dir", type=str, default="/kaggle/tmp/rsna_cache_336_9slice")
     parser.add_argument("--weights-path", type=str, default=None)
     parser.add_argument("--allow-random-init", action="store_true", default=False)
     parser.add_argument("--slot-dropout-p", type=float, default=0.0)
@@ -709,6 +774,7 @@ def main() -> None:
     parser.add_argument("--config-path", type=str, default="config.yaml")
     parser.add_argument("--num-workers", type=int, default=2)
     args = parser.parse_args()
+    args.gold_weight = resolve_gold_weight(args)
 
     if not args.weights_path and not args.allow_random_init:
         raise ValueError("Must supply --weights-path or explicitly pass --allow-random-init.")
@@ -730,16 +796,25 @@ def main() -> None:
     # Early fold validation in main() before spawning worker processes
     fold_col = "fold_id" if "fold_id" in chk_splits.columns else "fold"
     full_splits_df = pd.read_parquet(splits_p) if splits_p.suffix == ".parquet" else pd.read_csv(splits_p)
-    avail_folds = full_splits_df[fold_col].unique()
-    args.validated_folds = parse_target_folds(args, available_folds=avail_folds)
-    logger.info("Validated target folds for execution: %s", args.validated_folds)
 
-    if args.require_cache and args.cache_dir:
+    if args.limit:
+        cached = {p.stem for p in Path(args.cache_dir).glob("*.npz")}
+        full_splits_df = full_splits_df[full_splits_df["StudyInstanceUID"].astype(str).isin(cached)]
+        if full_splits_df.empty:
+            raise RuntimeError(f"--limit set but no cached .npz found in {args.cache_dir}")
+        if len(full_splits_df) > args.limit:
+            full_splits_df = full_splits_df.head(args.limit)
+
+    if args.require_cache or args.limit:
         uids = full_splits_df["StudyInstanceUID"].astype(str).tolist()
         valid_uids, empty_uids = verify_cache(args.cache_dir, uids, target_size=args.img_size, crop_mm=args.crop_mm)
         args.valid_uids = frozenset(valid_uids)
         args.empty_uids = frozenset(empty_uids)
         logger.info("Preflight cache verification passed for %d studies", len(valid_uids))
+
+    avail_folds = full_splits_df[fold_col].unique()
+    args.validated_folds = parse_target_folds(args, available_folds=avail_folds)
+    logger.info("Validated target folds for execution: %s", args.validated_folds)
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")

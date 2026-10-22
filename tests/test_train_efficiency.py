@@ -17,6 +17,7 @@ Verifies:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -171,7 +172,7 @@ def test_overfit_single_batch_loss_decreases():
         lr_head=1e-3,
     )
 
-    x = torch.randn(4, NUM_SLOTS, 3, 112, 112)
+    x = torch.randn(4, NUM_SLOTS, 9, 112, 112)
     m = torch.ones(4, NUM_SLOTS)
     y = (torch.rand(4, 12) > 0.5).float()
     g = torch.zeros(4, dtype=torch.long)
@@ -236,7 +237,7 @@ def test_model_accepts_float_and_bool_presence_masks():
     """Verify DINOv2SlotHead gathers slots identically under float32 and boolean presence masks."""
     torch.manual_seed(0)
     model = DINOv2SlotHead(pretrained=False, img_size=112, slot_dropout_p=0.0).eval()
-    x = torch.randn(2, NUM_SLOTS, 3, 112, 112)
+    x = torch.randn(2, NUM_SLOTS, 9, 112, 112)
     m_f = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 0, 1, 0, 1, 1]], dtype=torch.float32)
     with torch.no_grad():
         out_f = model(x, m_f)
@@ -297,14 +298,27 @@ def test_train_efficiency_2epoch_smoke_integration(tmp_path: Path, accum: int):
     n_studies = 20
     uids = [f"study_{i:03d}" for i in range(n_studies)]
 
-    # 1. Create temporary cached float16 tensors (6, 3, 112, 112) with metadata
+    # 1. Create temporary cached float16 tensors (6, 9, 112, 112) with metadata in .npz
     cache_dir = tmp_path / "tensor_cache"
     cache_dir.mkdir()
     for uid in uids:
-        tensor = torch.randn(NUM_SLOTS, 3, 112, 112, dtype=torch.float16)
-        presence = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0], dtype=torch.float32)
-        meta = {"size": 112, "crop_mm": 140.0}
-        torch.save({"image": tensor, "presence_mask": presence, "meta": meta}, cache_dir / f"{uid}.pt")
+        tensor = np.random.randn(NUM_SLOTS, 9, 112, 112).astype(np.float16)
+        presence = np.array([1.0, 1.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32)
+        with open(cache_dir / f"{uid}.npz", "wb") as f:
+            np.savez_compressed(f, image=tensor, presence_mask=presence, clipped=np.uint8(0))
+
+    manifest = {
+        "target_size": 112,
+        "crop_mm": 140.0,
+        "n_slices_cached": 9,
+        "sampling_strategy": "3zone",
+        "format": "npz",
+        "in_progress": False,
+        "failed_uids": [],
+        "empty_uids": [],
+    }
+    with open(cache_dir / "cache_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f)
 
     # 2. Create splits CSV (16 train, 4 val; 2 gold studies in val)
     splits_csv = tmp_path / "splits.csv"
